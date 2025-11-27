@@ -42,6 +42,10 @@ class G1HybridGymEnv(DirectRLEnv):
             lazy_load=False,
         )
 
+        self.ref_frame_idx = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot_cfg)
         # add ground plane
@@ -130,6 +134,21 @@ class G1HybridGymEnv(DirectRLEnv):
         self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+
+        rand_idx = torch.randint(
+            low=0,
+            high=len(self.dataset) - 1,
+            size=(len(env_ids),),
+            device=self.device,
+        )
+        self.ref_frame_idx[env_ids] = rand_idx
+        if len(env_ids) > 0:
+            i = int(env_ids[0])
+            frame = self.dataset[int(self.ref_frame_idx[i])]
+            print(
+                f"[G1HybridGymEnv] Env {i} reset with LAFAN frame {int(self.ref_frame_idx[i])} "
+                f"(keys: {list(frame.keys())})"
+            )
 
 
 @torch.jit.script
