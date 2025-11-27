@@ -2,6 +2,8 @@
 
 ## Overview
 
+LOOK AT G1_HYBRID_PRIOR REPO TO KNOW WHAT TO DO WITH THIS REPO
+
 This project/repository serves as a template for building projects or extensions based on Isaac Lab.
 It allows you to develop in an isolated environment, outside of the core Isaac Lab repository.
 
