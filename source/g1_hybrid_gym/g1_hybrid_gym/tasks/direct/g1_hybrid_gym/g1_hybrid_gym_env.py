@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 import torch
 from collections.abc import Sequence
+from pathlib import Path
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
@@ -16,12 +17,15 @@ from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.math import sample_uniform
 
 from .g1_hybrid_gym_env_cfg import G1HybridGymEnvCfg
+from g1_hybrid_prior.dataset import G1HybridPriorDataset
 
 
 class G1HybridGymEnv(DirectRLEnv):
     cfg: G1HybridGymEnvCfg
 
-    def __init__(self, cfg: G1HybridGymEnvCfg, render_mode: str | None = None, **kwargs):
+    def __init__(
+        self, cfg: G1HybridGymEnvCfg, render_mode: str | None = None, **kwargs
+    ):
         super().__init__(cfg, render_mode, **kwargs)
 
         self._cart_dof_idx, _ = self.robot.find_joints(self.cfg.cart_dof_name)
@@ -29,6 +33,14 @@ class G1HybridGymEnv(DirectRLEnv):
 
         self.joint_pos = self.robot.data.joint_pos
         self.joint_vel = self.robot.data.joint_vel
+
+        self.dataset = G1HybridPriorDataset(
+            file_path=Path(
+                "/home/valerio/g1_hybrid_prior/data_raw/LAFAN1_Retargeting_Dataset/g1/dance1_subject1.csv"
+            ),
+            robot="g1",
+            lazy_load=False,
+        )
 
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot_cfg)
@@ -49,7 +61,9 @@ class G1HybridGymEnv(DirectRLEnv):
         self.actions = actions.clone()
 
     def _apply_action(self) -> None:
-        self.robot.set_joint_effort_target(self.actions * self.cfg.action_scale, joint_ids=self._cart_dof_idx)
+        self.robot.set_joint_effort_target(
+            self.actions * self.cfg.action_scale, joint_ids=self._cart_dof_idx
+        )
 
     def _get_observations(self) -> dict:
         obs = torch.cat(
@@ -84,8 +98,13 @@ class G1HybridGymEnv(DirectRLEnv):
         self.joint_vel = self.robot.data.joint_vel
 
         time_out = self.episode_length_buf >= self.max_episode_length - 1
-        out_of_bounds = torch.any(torch.abs(self.joint_pos[:, self._cart_dof_idx]) > self.cfg.max_cart_pos, dim=1)
-        out_of_bounds = out_of_bounds | torch.any(torch.abs(self.joint_pos[:, self._pole_dof_idx]) > math.pi / 2, dim=1)
+        out_of_bounds = torch.any(
+            torch.abs(self.joint_pos[:, self._cart_dof_idx]) > self.cfg.max_cart_pos,
+            dim=1,
+        )
+        out_of_bounds = out_of_bounds | torch.any(
+            torch.abs(self.joint_pos[:, self._pole_dof_idx]) > math.pi / 2, dim=1
+        )
         return out_of_bounds, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
@@ -128,8 +147,16 @@ def compute_rewards(
 ):
     rew_alive = rew_scale_alive * (1.0 - reset_terminated.float())
     rew_termination = rew_scale_terminated * reset_terminated.float()
-    rew_pole_pos = rew_scale_pole_pos * torch.sum(torch.square(pole_pos).unsqueeze(dim=1), dim=-1)
-    rew_cart_vel = rew_scale_cart_vel * torch.sum(torch.abs(cart_vel).unsqueeze(dim=1), dim=-1)
-    rew_pole_vel = rew_scale_pole_vel * torch.sum(torch.abs(pole_vel).unsqueeze(dim=1), dim=-1)
-    total_reward = rew_alive + rew_termination + rew_pole_pos + rew_cart_vel + rew_pole_vel
+    rew_pole_pos = rew_scale_pole_pos * torch.sum(
+        torch.square(pole_pos).unsqueeze(dim=1), dim=-1
+    )
+    rew_cart_vel = rew_scale_cart_vel * torch.sum(
+        torch.abs(cart_vel).unsqueeze(dim=1), dim=-1
+    )
+    rew_pole_vel = rew_scale_pole_vel * torch.sum(
+        torch.abs(pole_vel).unsqueeze(dim=1), dim=-1
+    )
+    total_reward = (
+        rew_alive + rew_termination + rew_pole_pos + rew_cart_vel + rew_pole_vel
+    )
     return total_reward
