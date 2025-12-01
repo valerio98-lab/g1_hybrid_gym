@@ -42,9 +42,32 @@ class G1HybridGymEnv(DirectRLEnv):
             lazy_load=False,
         )
 
+        print(f"[G1HybridGymEnv] Loaded dataset with {len(self.dataset)} frames")
+
+        dataset_joint_names = self.dataset.robot_cfg.joint_order
+        print("[G1HybridGymEnv] Dataset joints:", dataset_joint_names)
+        
+        isaac_joint_names = self.robot.joint_names ## robot joint names in isaac order. The function returns a list of str
+        print("[G1HybridGymEnv] Isaac joints:", isaac_joint_names)
+
+        dataset_to_isaac_indexes: list[int] = []
+        for name in dataset_joint_names:
+            if name not in isaac_joint_names:
+                raise ValueError(
+                    f"[G1HybridGymEnv] Joint '{name}' from dataset not found in robot articulation!"
+                )
+            dataset_to_isaac_indexes.append(isaac_joint_names.index(name))
+        self.dataset_to_isaac_indexes = torch.tensor(
+            dataset_to_isaac_indexes, device=self.device
+        )
         self.ref_frame_idx = torch.zeros(
             self.num_envs, dtype=torch.long, device=self.device
         )
+
+        self.joint_pos = self.robot.data.joint_pos
+        self.joint_vel = self.robot.data.joint_vel
+
+        self.actions = None
 
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot_cfg)
@@ -62,20 +85,39 @@ class G1HybridGymEnv(DirectRLEnv):
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        self.actions = actions.clone()
+        if actions is not None:
+            self.actions = actions.clone()
 
     def _apply_action(self) -> None:
-        self.robot.set_joint_effort_target(
-            self.actions * self.cfg.action_scale, joint_ids=self._cart_dof_idx
-        )
+        # self.robot.set_joint_effort_target(
+        #     self.actions * self.cfg.action_scale, joint_ids=self._cart_dof_idx
+        # )
+        return 
 
     def _get_observations(self) -> dict:
+        joint_full_pos = self.robot.data.joint_pos
+        joint_full_vel = self.robot.data.joint_vel
+        joint_pos = joint_full_pos[:, self.dataset_to_isaac_indexes]
+        joint_vel = joint_full_vel[:, self.dataset_to_isaac_indexes]
+        
+        ref_joint_pos = []
+        ref_joint_vel = []
+
+        for env_id in range(self.num_envs):
+            frame_idx = self.ref_frame_idx[env_id]
+            frame = self.dataset[frame_idx]
+            ref_joint_pos.append(frame["joints"])
+            ref_joint_vel.append(frame["joint_vel"])
+
+        ref_joint_pos = torch.stack(ref_joint_pos, dim=0).to(self.device)
+        ref_joint_vel = torch.stack(ref_joint_vel, dim=0).to(self.device)
+
         obs = torch.cat(
             (
-                self.joint_pos[:, self._pole_dof_idx[0]].unsqueeze(dim=1),
-                self.joint_vel[:, self._pole_dof_idx[0]].unsqueeze(dim=1),
-                self.joint_pos[:, self._cart_dof_idx[0]].unsqueeze(dim=1),
-                self.joint_vel[:, self._cart_dof_idx[0]].unsqueeze(dim=1),
+                joint_pos,
+                joint_vel,
+                ref_joint_pos,
+                ref_joint_vel,
             ),
             dim=-1,
         )
@@ -83,99 +125,125 @@ class G1HybridGymEnv(DirectRLEnv):
         return observations
 
     def _get_rewards(self) -> torch.Tensor:
+        self.joint_pos = self.robot.data.joint_pos[:, self.dataset_to_isaac_indexes]
+        self.joint_vel = self.robot.data.joint_vel[:, self.dataset_to_isaac_indexes]
+        ref_joint_pos = []
+        ref_joint_vel = []
+        for env_id in range(self.num_envs):
+            frame_idx = self.ref_frame_idx[env_id]
+            frame = self.dataset[frame_idx]
+            ref_joint_pos.append(frame["joints"])
+            ref_joint_vel.append(frame["joint_vel"])
+
+        ref_joint_pos = torch.stack(ref_joint_pos, dim=0).to(self.device)
+        ref_joint_vel = torch.stack(ref_joint_vel, dim=0).to(self.device) 
+        
         total_reward = compute_rewards(
-            self.cfg.rew_scale_alive,
-            self.cfg.rew_scale_terminated,
-            self.cfg.rew_scale_pole_pos,
-            self.cfg.rew_scale_cart_vel,
-            self.cfg.rew_scale_pole_vel,
-            self.joint_pos[:, self._pole_dof_idx[0]],
-            self.joint_vel[:, self._pole_dof_idx[0]],
-            self.joint_pos[:, self._cart_dof_idx[0]],
-            self.joint_vel[:, self._cart_dof_idx[0]],
+            self.cfg.rew_w_pose,
+            self.cfg.rew_w_vel,
+            self.cfg.rew_alive,
+            self.joint_pos, 
+            self.joint_vel,
+            ref_joint_pos,
+            ref_joint_vel,
             self.reset_terminated,
         )
         return total_reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        self.joint_pos = self.robot.data.joint_pos
-        self.joint_vel = self.robot.data.joint_vel
-
         time_out = self.episode_length_buf >= self.max_episode_length - 1
-        out_of_bounds = torch.any(
-            torch.abs(self.joint_pos[:, self._cart_dof_idx]) > self.cfg.max_cart_pos,
-            dim=1,
-        )
-        out_of_bounds = out_of_bounds | torch.any(
-            torch.abs(self.joint_pos[:, self._pole_dof_idx]) > math.pi / 2, dim=1
-        )
-        return out_of_bounds, time_out
+
+        terminated = torch.zeros_like(time_out, dtype=torch.bool, device=self.device)
+
+        return terminated, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
         if env_ids is None:
             env_ids = self.robot._ALL_INDICES
+        env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
+
         super()._reset_idx(env_ids)
 
-        joint_pos = self.robot.data.default_joint_pos[env_ids]
-        joint_pos[:, self._pole_dof_idx] += sample_uniform(
-            self.cfg.initial_pole_angle_range[0] * math.pi,
-            self.cfg.initial_pole_angle_range[1] * math.pi,
-            joint_pos[:, self._pole_dof_idx].shape,
-            joint_pos.device,
-        )
-        joint_vel = self.robot.data.default_joint_vel[env_ids]
+        device = self.device
 
-        default_root_state = self.robot.data.default_root_state[env_ids]
-        default_root_state[:, :3] += self.scene.env_origins[env_ids]
+        # stato di default
+        root_state = self.robot.data.default_root_state[env_ids].clone()
+        joint_pos = self.robot.data.default_joint_pos[env_ids].clone()
+        joint_vel = self.robot.data.default_joint_vel[env_ids].clone()
 
-        self.joint_pos[env_ids] = joint_pos
-        self.joint_vel[env_ids] = joint_vel
+        # origins delle env
+        env_origins = self.scene.env_origins[env_ids]
 
-        self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
-        self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
-        self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
-
+        # scegli frame di riferimento dal dataset per ogni env
         rand_idx = torch.randint(
             low=0,
-            high=len(self.dataset) - 1,
-            size=(len(env_ids),),
-            device=self.device,
+            high=len(self.dataset),
+            size=(env_ids.shape[0],),
+            device=device,
         )
         self.ref_frame_idx[env_ids] = rand_idx
-        if len(env_ids) > 0:
-            i = int(env_ids[0])
-            frame = self.dataset[int(self.ref_frame_idx[i])]
-            print(
-                f"[G1HybridGymEnv] Env {i} reset with LAFAN frame {int(self.ref_frame_idx[i])} "
-                f"(keys: {list(frame.keys())})"
-            )
+
+        # applica frame LAFAN a root + joint
+        for i in range(env_ids.shape[0]):
+            env_id = int(env_ids[i].item())
+            frame_idx = int(self.ref_frame_idx[env_id].item())
+            frame = self.dataset[frame_idx]
+
+            # root pose (pos + quat wxyz)
+            f_root_pos = frame["root_pos"].to(device=device, dtype=torch.float32)
+            f_root_quat = frame["root_quat_wxyz"].to(device=device, dtype=torch.float32)
+
+            # root velocities
+            f_root_lin_vel = frame["root_lin_vel"].to(device=device, dtype=torch.float32)
+            f_root_ang_vel = frame["root_ang_vel"].to(device=device, dtype=torch.float32)
+
+            # joints (29 DOF) in ordine dataset
+            f_joints = frame["joints"].to(device=device, dtype=torch.float32)
+            f_joint_vel = frame["joint_vel"].to(device=device, dtype=torch.float32)
+
+            # scrivi root pos/rot (offsettata dall'origine dell'env)
+            root_state[i, 0:3] = f_root_pos + env_origins[i]
+            root_state[i, 3:7] = f_root_quat
+
+            # scrivi root vel
+            root_state[i, 7:10] = f_root_lin_vel
+            root_state[i, 10:13] = f_root_ang_vel
+
+            # scrivi joints solo sui DOF tracciati
+            joint_pos[i, self.dataset_to_isaac_indexes] = f_joints
+            joint_vel[i, self.dataset_to_isaac_indexes] = f_joint_vel
+
+        # applica allo stato della simulazione
+        self.robot.write_root_pose_to_sim(root_state[:, :7], env_ids)
+        self.robot.write_root_velocity_to_sim(root_state[:, 7:], env_ids)
+        self.robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
+
+        # debug: stampa un env a caso
+        env0 = int(env_ids[0].item())
+        print(
+            f"[G1HybridGymEnv] Env {env0} reset with LAFAN frame {int(self.ref_frame_idx[env0].item())}"
+        )
 
 
 @torch.jit.script
 def compute_rewards(
-    rew_scale_alive: float,
-    rew_scale_terminated: float,
-    rew_scale_pole_pos: float,
-    rew_scale_cart_vel: float,
-    rew_scale_pole_vel: float,
-    pole_pos: torch.Tensor,
-    pole_vel: torch.Tensor,
-    cart_pos: torch.Tensor,
-    cart_vel: torch.Tensor,
-    reset_terminated: torch.Tensor,
-):
-    rew_alive = rew_scale_alive * (1.0 - reset_terminated.float())
-    rew_termination = rew_scale_terminated * reset_terminated.float()
-    rew_pole_pos = rew_scale_pole_pos * torch.sum(
-        torch.square(pole_pos).unsqueeze(dim=1), dim=-1
+    rew_w_pose: float,
+    rew_w_vel: float,
+    rew_alive: float,
+    joint_pos: torch.Tensor,
+    joint_vel: torch.Tensor,
+    ref_joint_pos: torch.Tensor,
+    ref_joint_vel: torch.Tensor,
+    reset_terminated: torch.Tensor ) -> torch.Tensor:
+    
+    pose_error = torch.sum(
+        torch.square(joint_pos - ref_joint_pos), dim=-1
     )
-    rew_cart_vel = rew_scale_cart_vel * torch.sum(
-        torch.abs(cart_vel).unsqueeze(dim=1), dim=-1
+    vel_error = torch.sum(
+        torch.square(joint_vel - ref_joint_vel), dim=-1
     )
-    rew_pole_vel = rew_scale_pole_vel * torch.sum(
-        torch.abs(pole_vel).unsqueeze(dim=1), dim=-1
-    )
-    total_reward = (
-        rew_alive + rew_termination + rew_pole_pos + rew_cart_vel + rew_pole_vel
-    )
+    rew_pose = -rew_w_pose * pose_error
+    rew_vel = -rew_w_vel * vel_error
+    rew_alive = rew_alive * torch.ones_like(rew_pose)
+    total_reward = rew_pose + rew_vel + rew_alive
     return total_reward
