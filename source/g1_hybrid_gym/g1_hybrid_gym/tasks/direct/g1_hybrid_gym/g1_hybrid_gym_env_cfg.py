@@ -19,7 +19,7 @@ class G1HybridGymEnvCfg(DirectRLEnvCfg):
     episode_length_s = 5.0
     # - spaces definition
     action_space = 1
-    observation_space = 4
+    observation_space = 116
     state_space = 0
 
     # simulation
@@ -35,10 +35,6 @@ class G1HybridGymEnvCfg(DirectRLEnvCfg):
         num_envs=512, env_spacing=4.0, replicate_physics=True
     )
 
-    # custom parameters/scales
-    # - controllable joint
-    cart_dof_name = "left_hip_pitch_joint"
-    pole_dof_name = "right_hip_pitch_joint"
     # - action scale
     action_scale = 100.0  # [N]
     # - reward scales
