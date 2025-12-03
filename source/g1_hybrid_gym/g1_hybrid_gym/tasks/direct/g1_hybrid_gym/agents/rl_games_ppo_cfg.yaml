@@ -62,7 +62,7 @@ params:
     lr_schedule: adaptive
     kl_threshold: 0.008
     score_to_win: 20000
-    max_epochs: 30
+    max_epochs: 90
     save_best_after: 10
     save_frequency: 5
     grad_norm: 1.0
@@ -70,7 +70,7 @@ params:
     truncate_grads: True
     e_clip: 0.2
     horizon_length: 16
-    minibatch_size: 8192
+    minibatch_size: 64 
     mini_epochs: 8
     critic_coef: 4
     clip_value: True

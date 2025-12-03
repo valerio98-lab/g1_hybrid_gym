@@ -18,21 +18,21 @@ class G1HybridGymEnvCfg(DirectRLEnvCfg):
     decimation = 2
     episode_length_s = 5.0
     # - spaces definition
-    action_space = 1
+    action_space = 29
     observation_space = 116
     state_space = 0
 
     # simulation
-    sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=decimation)
+    sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=decimation, gravity=(0.0, 0.0, -9.81))
 
     # robot(s)
     robot_cfg: ArticulationCfg = G1_29DOF_CFG.replace(
-        prim_path="/World/envs/env_.*/Robot"
+        prim_path="/World/envs/env_.*/Robot", 
     )
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=512, env_spacing=4.0, replicate_physics=True
+        num_envs=20, env_spacing=4.0, replicate_physics=True
     )
 
     # - action scale
