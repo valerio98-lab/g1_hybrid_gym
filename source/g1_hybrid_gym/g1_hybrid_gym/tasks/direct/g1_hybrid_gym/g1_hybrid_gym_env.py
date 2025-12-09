@@ -158,6 +158,10 @@ class G1HybridGymEnv(DirectRLEnv):
         ref_joint_pos = torch.stack(ref_joint_pos, dim=0).to(self.device)
         ref_joint_vel = torch.stack(ref_joint_vel, dim=0).to(self.device)
 
+        # pose_error = torch.mean(torch.abs(joint_pos - ref_joint_pos)).item()
+        # vel_error  = torch.mean(torch.abs(joint_vel - ref_joint_vel)).item()
+        # print(f"mean |pose error| per joint: {pose_error:.4f}, |vel error|: {vel_error:.4f}")
+
         total_reward = compute_rewards(
             self.cfg.rew_w_pose,
             self.cfg.rew_w_vel,
