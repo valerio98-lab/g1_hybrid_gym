@@ -12,7 +12,7 @@ params:
     name: a2c_continuous
 
   model:
-    name: continuous_a2c_logstd
+    name: expert_low_level
 
   # doesn't have this fine grained control but made it close
   network:
@@ -43,7 +43,7 @@ params:
   load_path: '' # path to the checkpoint to load
 
   config:
-    name: cartpole_direct
+    name: g1_hybrid_gym_ppo
     env_name: rlgpu
     device: 'cuda:0'
     device_name: 'cuda:0'
