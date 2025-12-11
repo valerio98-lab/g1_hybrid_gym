@@ -58,12 +58,11 @@ class G1HybridGymEnv(DirectRLEnv):
             dataset_to_isaac_indexes.append(isaac_joint_names.index(name))
             joint_idx, _ = self.robot.find_joints(name)
             _g1_dof_idx.append(joint_idx)
-        
+
         self.dataset_to_isaac_indexes = torch.tensor(
             dataset_to_isaac_indexes, device=self.device
         )
         self._g1_dof_idx = torch.tensor(_g1_dof_idx, device=self.device)
-            
 
         self.ref_frame_idx = torch.zeros(
             self.num_envs, dtype=torch.long, device=self.device
@@ -94,50 +93,83 @@ class G1HybridGymEnv(DirectRLEnv):
         if actions is not None:
             self.actions = actions.clone()
 
-
     def _apply_action(self) -> None:
-        ref_joint_pos = []
-        ref_joint_vel = []
-        for env_id in range(self.num_envs):
-            frame_idx = int(self.ref_frame_idx[env_id].item())
-            frame = self.dataset[frame_idx]
-            ref_joint_pos.append(frame["joints"])
-            ref_joint_vel.append(frame["joint_vel"])
+        if self.actions is None:
+            return
 
-        ref_joint_pos = torch.stack(ref_joint_pos, dim=0).to(self.device).unsqueeze(-1)
-        ref_joint_vel = torch.stack(ref_joint_vel, dim=0).to(self.device).unsqueeze(-1)
-        
-        # apply action as PD target
-        self.robot.set_joint_position_target(ref_joint_pos, joint_ids=self._g1_dof_idx)
-        self.robot.set_joint_velocity_target(ref_joint_vel, joint_ids=self._g1_dof_idx)
+        actions = self.actions.to(self.device)
+        scaled_actions = actions * self.cfg.action_scale
+        joint_pos = self.robot.data.joint_pos[:, self.dataset_to_isaac_indexes]
+
+        target_joint_pos = joint_pos + scaled_actions
+        target_joint_pos = target_joint_pos.unsqueeze(-1)
+
+        self.robot.set_joint_position_target(
+            target_joint_pos,
+            joint_ids=self._g1_dof_idx,
+        )
 
     def _get_observations(self) -> dict:
+        root_state = self.robot.data.root_state_w
+        root_pos = root_state[:, 0:3]
+        root_rot = root_state[:, 3:7] 
+        root_lin_vel = root_state[:, 7:10]
+        root_ang_vel = root_state[:, 10:13]
+
+        env_origins = self.scene.env_origins  
+        root_char_pos = root_pos - env_origins
+        h = root_char_pos[:, 2:3]
+
         joint_full_pos = self.robot.data.joint_pos
         joint_full_vel = self.robot.data.joint_vel
         joint_pos = joint_full_pos[:, self.dataset_to_isaac_indexes]
         joint_vel = joint_full_vel[:, self.dataset_to_isaac_indexes]
 
+        s_cur = torch.cat(
+            (h, root_rot, root_lin_vel, root_ang_vel, joint_pos, joint_vel),
+            dim=-1,
+        )
+
         ref_joint_pos = []
         ref_joint_vel = []
+        ref_root_pos = []
+        ref_root_quat = []
+        ref_root_lin_vel = []
+        ref_root_ang_vel = []
 
         for env_id in range(self.num_envs):
             frame_idx = int(self.ref_frame_idx[env_id].item())
             frame = self.dataset[frame_idx]
             ref_joint_pos.append(frame["joints"])
             ref_joint_vel.append(frame["joint_vel"])
+            ref_root_pos.append(frame["root_pos"])
+            ref_root_quat.append(frame["root_quat_wxyz"])
+            ref_root_lin_vel.append(frame["root_lin_vel"])
+            ref_root_ang_vel.append(frame["root_ang_vel"])
 
         ref_joint_pos = torch.stack(ref_joint_pos, dim=0).to(self.device)
         ref_joint_vel = torch.stack(ref_joint_vel, dim=0).to(self.device)
+        ref_root_pos = torch.stack(ref_root_pos, dim=0).to(self.device)
+        ref_root_quat = torch.stack(ref_root_quat, dim=0).to(self.device)
+        ref_root_lin_vel = torch.stack(ref_root_lin_vel, dim=0).to(self.device)
+        ref_root_ang_vel = torch.stack(ref_root_ang_vel, dim=0).to(self.device)
 
-        obs = torch.cat(
+        h_ref = ref_root_pos[:, 2:3]
+
+        s_ref = torch.cat(
             (
-                joint_pos,
-                joint_vel,
+                h_ref,
+                ref_root_quat,
+                ref_root_lin_vel,
+                ref_root_ang_vel,
                 ref_joint_pos,
                 ref_joint_vel,
             ),
             dim=-1,
         )
+
+        obs = torch.cat((s_cur, s_ref), dim=-1)
+
         alive = ~self.reset_buf
         self.ref_frame_idx[alive] += 1
         self.ref_frame_idx.clamp_(0, self.max_frame_idx)
@@ -176,8 +208,10 @@ class G1HybridGymEnv(DirectRLEnv):
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
+        root_pos_z = self.robot.data.root_state_w[:, 2]
+        fallen = root_pos_z < self.cfg.min_height_reset
 
-        terminated = torch.zeros_like(time_out, dtype=torch.bool, device=self.device)
+        terminated = fallen
 
         return terminated, time_out
 
@@ -189,7 +223,7 @@ class G1HybridGymEnv(DirectRLEnv):
         super()._reset_idx(env_ids)
 
         device = self.device
-        self.ref_frame_idx[env_ids] = 0 
+        self.ref_frame_idx[env_ids] = 0
 
         # stato di default
         default_root_state = self.robot.data.default_root_state[env_ids].clone()
@@ -231,7 +265,6 @@ class G1HybridGymEnv(DirectRLEnv):
         self.robot.write_joint_state_to_sim(
             default_joint_pos, default_joint_vel, None, env_ids
         )
-
 
 
 @torch.jit.script

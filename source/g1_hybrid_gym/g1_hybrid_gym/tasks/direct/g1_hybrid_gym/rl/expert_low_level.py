@@ -9,31 +9,26 @@ class ExpertLowLevelPolicy(ModelA2CContinuousLogStd):
         super().__init__(network)
 
     def build(self, config):
-        """
-        RL-Games use this method to build the policy network.
-        """
-        obs_shape = config["input_shape"]  #(116,)
+
+        obs_shape = config["input_shape"]  # (127,)
         if len(obs_shape) != 1:
             raise RuntimeError(
                 f"[ExpertLowLevelPolicy] Only flat obs supported, got shape={obs_shape}"
             )
 
         full_obs_dim = obs_shape[0]  # 4 * n_joints expected
-        if full_obs_dim % 4 != 0:
+        if (full_obs_dim) % 2 != 0:
             raise RuntimeError(
                 f"[ExpertLowLevelPolicy] Expected obs = [q, qdot, q_ref, qdot_ref] with dim 4 * n_joints, "
                 f"but got dim={full_obs_dim}"
             )
 
-        n_joints = full_obs_dim // 4
-        obs_dim = 2 * n_joints  # [q, qdot]
-        goal_dim = 2 * n_joints  # [q_ref - q, qdot_ref - qdot]
+        state_dim = (full_obs_dim) // 2
+        obs_dim = state_dim  # [q, qdot]
+        goal_dim = state_dim  # [q_ref - q, qdot_ref - qdot]
         action_dim = config["actions_num"]
         device = config.get("device", "cuda:0")
 
-        print(
-            f"[ExpertLowLevelPolicy] full_obs_dim={full_obs_dim}, n_joints={n_joints}"
-        )
         print(
             f"[ExpertLowLevelPolicy] obs_dim={obs_dim}, goal_dim={goal_dim}, action_dim={action_dim}"
         )
@@ -56,33 +51,32 @@ class ExpertLowLevelPolicy(ModelA2CContinuousLogStd):
             normalize_value=normalize_value,
             normalize_input=normalize_input,
             value_size=value_size,
-            n_joints=n_joints,
         )
 
     class Network(ModelA2CContinuousLogStd.Network):
-        def __init__(self, a2c_network, n_joints, **kwargs):
+        def __init__(self, a2c_network, **kwargs):
             super().__init__(a2c_network, **kwargs)
-            self.n_joints = n_joints
+            full_dim = self.obs_shape[0]
+
+            if full_dim % 2 != 0:
+                raise RuntimeError(
+                    f"[ExpertLowLevelPolicy.Network] obs dim={full_dim} is not even; "
+                    f"expected [s_cur, s_ref]"
+                )
+            self.state_dim = full_dim // 2  # dim di s_cur (e s_ref)
 
         def forward(self, input_dict):
             is_train = input_dict.get("is_train", True)
             prev_actions = input_dict.get("prev_actions", None)
 
-            obs = self.norm_obs(input_dict["obs"])
-            joint_pos = obs[:, 0 : self.n_joints]
-            joint_vel = obs[:, self.n_joints : 2 * self.n_joints]
-            ref_pos = obs[:, 2 * self.n_joints : 3 * self.n_joints]
-            ref_vel = obs[:, 3 * self.n_joints : 4 * self.n_joints]
+            # obs_full = [s_cur, s_ref]
+            obs_full = self.norm_obs(input_dict["obs"])
+            state_dim = self.state_dim
 
-            obs_final_state = torch.cat([joint_pos, joint_vel], dim=-1)
+            obs = obs_full[..., :state_dim]  # s_cur
+            goal = obs_full[..., state_dim:]  # s_ref
 
-            # goal = errore rispetto al mocap
-            goal = torch.cat(
-                [ref_pos - joint_pos, ref_vel - joint_vel],
-                dim=-1,
-            )
-
-            mu, log_std, value = self.a2c_network(obs_final_state, goal)
+            mu, log_std, value = self.a2c_network(obs, goal)
             value = value.squeeze(-1)
             sigma = torch.exp(log_std)
 
@@ -102,7 +96,6 @@ class ExpertLowLevelPolicy(ModelA2CContinuousLogStd):
                     "mus": mu,
                     "sigmas": sigma,
                 }
-
             else:
                 action = distr.sample()
                 neglogp = self.neglogp(action, mu, sigma, log_std)

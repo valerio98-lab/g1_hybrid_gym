@@ -19,15 +19,17 @@ class G1HybridGymEnvCfg(DirectRLEnvCfg):
     episode_length_s = 5.0
     # - spaces definition
     action_space = 29
-    observation_space = 116
+    observation_space = 136
     state_space = 0
 
     # simulation
-    sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=decimation, gravity=(0.0, 0.0, -9.81))
+    sim: SimulationCfg = SimulationCfg(
+        dt=1 / 120, render_interval=decimation, gravity=(0.0, 0.0, -9.81)
+    )
 
     # robot(s)
     robot_cfg: ArticulationCfg = G1_29DOF_CFG.replace(
-        prim_path="/World/envs/env_.*/Robot", 
+        prim_path="/World/envs/env_.*/Robot",
     )
 
     # scene
@@ -36,10 +38,10 @@ class G1HybridGymEnvCfg(DirectRLEnvCfg):
     )
 
     # - action scale
-    action_scale = 100.0  # [N]
+    action_scale = 1.0  # [N]
     # - reward scales
     rew_w_pose = 1.0
     rew_w_vel = 0.01
     rew_alive = 0.1
     # - reset states/conditions
-    max_cart_pos = 3.0  # reset if cart exceeds this position [m]
+    min_height_reset = 0.5  # reset if robot falls below this height [m]
