@@ -15,11 +15,11 @@ from isaaclab.utils import configclass
 @configclass
 class G1HybridGymEnvCfg(DirectRLEnvCfg):
     # env
-    decimation = 2
+    decimation = 4
     episode_length_s = 5.0
     # - spaces definition
     action_space = 29
-    observation_space = 136
+    observation_space = 138
     state_space = 0
 
     # simulation

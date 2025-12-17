@@ -1,11 +1,10 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
 from __future__ import annotations
 
-import math
 import torch
 from collections.abc import Sequence
 from pathlib import Path
@@ -17,6 +16,11 @@ from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 
 from .g1_hybrid_gym_env_cfg import G1HybridGymEnvCfg
 from g1_hybrid_prior.dataset import G1HybridPriorDataset
+from g1_hybrid_prior.helpers import (
+    quat_normalize,
+    quat_rotate,
+    quat_rotate_inv,
+)
 
 
 class G1HybridGymEnv(DirectRLEnv):
@@ -27,9 +31,11 @@ class G1HybridGymEnv(DirectRLEnv):
     ):
         super().__init__(cfg, render_mode, **kwargs)
 
-        self.joint_pos = self.robot.data.joint_pos
-        self.joint_vel = self.robot.data.joint_vel
+        # Keep previous orientation to express CURRENT sim velocities in (prev) BODY frame
+        # (matches your dataset convention)
+        self._prev_root_quat_wxyz: torch.Tensor | None = None  # (N,4)
 
+        # --- Dataset ---
         self.dataset = G1HybridPriorDataset(
             file_path=Path(
                 "/home/valerio/g1_hybrid_prior/data_raw/LAFAN1_Retargeting_Dataset/g1/dance1_subject2.csv"
@@ -37,55 +43,151 @@ class G1HybridGymEnv(DirectRLEnv):
             robot="g1",
             lazy_load=False,
         )
-
         print(f"[G1HybridGymEnv] Loaded dataset with {len(self.dataset)} frames")
 
         dataset_joint_names = self.dataset.robot_cfg.joint_order
-        print("[G1HybridGymEnv] Dataset joints:", dataset_joint_names)
-
-        isaac_joint_names = (
-            self.robot.joint_names
-        )  ## robot joint names in isaac order. The function returns a list of str
-        print("[G1HybridGymEnv] Isaac joints:", isaac_joint_names)
+        isaac_joint_names = self.robot.joint_names
 
         dataset_to_isaac_indexes: list[int] = []
-        _g1_dof_idx = []
+        g1_dof_idx: list[int] = []
+
         for name in dataset_joint_names:
             if name not in isaac_joint_names:
                 raise ValueError(
                     f"[G1HybridGymEnv] Joint '{name}' from dataset not found in robot articulation!"
                 )
+
             dataset_to_isaac_indexes.append(isaac_joint_names.index(name))
+
             joint_idx, _ = self.robot.find_joints(name)
-            _g1_dof_idx.append(joint_idx)
+            joint_idx_t = (
+                torch.as_tensor(joint_idx, dtype=torch.long).reshape(-1).to(self.device)
+            )
+            if joint_idx_t.numel() != 1:
+                raise RuntimeError(
+                    f"find_joints('{name}') returned {joint_idx_t.numel()} indices: {joint_idx_t}"
+                )
+
+            g1_dof_idx.append(int(joint_idx_t.item()))
 
         self.dataset_to_isaac_indexes = torch.tensor(
-            dataset_to_isaac_indexes, device=self.device
+            dataset_to_isaac_indexes, device=self.device, dtype=torch.long
         )
-        self._g1_dof_idx = torch.tensor(_g1_dof_idx, device=self.device)
 
+        # Keep (J,1) on purpose -> targets must be (N,J,1)
+        self._g1_dof_idx = torch.tensor(
+            g1_dof_idx, device=self.device, dtype=torch.long
+        ).unsqueeze(-1)
+        assert self._g1_dof_idx.ndim == 2 and self._g1_dof_idx.shape[1] == 1, (
+            f"Expected _g1_dof_idx shape (J,1), got {tuple(self._g1_dof_idx.shape)}. "
+            "If you switch to (J,), remove the unsqueeze(-1) in _apply_action."
+        )
+
+        # Reference index per env
         self.ref_frame_idx = torch.zeros(
             self.num_envs, dtype=torch.long, device=self.device
         )
         self.max_frame_idx = len(self.dataset) - 1
 
-        self.joint_pos = self.robot.data.joint_pos
-        self.joint_vel = self.robot.data.joint_vel
+        self.actions: torch.Tensor | None = None
 
-        self.actions = None
+        # Cache to guarantee reward uses the *exact same ref* as obs in the step
+        self._cached_ref_joint_pos: torch.Tensor | None = None
+        self._cached_ref_joint_vel: torch.Tensor | None = None
+
+        # Pre-stacked reference tensors for fast indexing (if non-lazy)
+        self._ref_root_pos: torch.Tensor | None = None
+        self._ref_root_quat_wxyz: torch.Tensor | None = None
+        self._ref_root_lin_vel: torch.Tensor | None = None
+        self._ref_root_ang_vel: torch.Tensor | None = None
+        self._ref_joints: torch.Tensor | None = None
+        self._ref_joint_vel: torch.Tensor | None = None
+
+        self._build_reference_tensors()
+
+    # -------------------------------------------------------------------------
+    # Reference utils
+    # -------------------------------------------------------------------------
+
+    def _build_reference_tensors(self) -> None:
+        """Pre-stack dataset frames into tensors for fast batched indexing."""
+        if getattr(self.dataset, "lazy_load", False):
+            return
+
+        frames = getattr(self.dataset, "dataset", None)
+        if not frames:
+            return
+
+        root_pos = torch.stack([f["root_pos"] for f in frames], dim=0)  # (T,3)
+        root_quat = torch.stack([f["root_quat_wxyz"] for f in frames], dim=0)  # (T,4)
+        root_lin_vel = torch.stack(
+            [f["root_lin_vel"] for f in frames], dim=0
+        )  # (T,3) BODY
+        root_ang_vel = torch.stack(
+            [f["root_ang_vel"] for f in frames], dim=0
+        )  # (T,3) BODY
+        joints = torch.stack([f["joints"] for f in frames], dim=0)  # (T,J)
+        joint_vel = torch.stack([f["joint_vel"] for f in frames], dim=0)  # (T,J)
+
+        self._ref_root_pos = root_pos.to(self.device)
+        self._ref_root_quat_wxyz = root_quat.to(self.device)
+        self._ref_root_lin_vel = root_lin_vel.to(self.device)
+        self._ref_root_ang_vel = root_ang_vel.to(self.device)
+        self._ref_joints = joints.to(self.device)
+        self._ref_joint_vel = joint_vel.to(self.device)
+
+    def _get_ref_batch(self, frame_idx: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Return a batched reference dict for given per-env frame indices."""
+        idx = frame_idx.clamp(0, self.max_frame_idx)
+
+        if self._ref_joints is not None:
+            return {
+                "root_pos": self._ref_root_pos.index_select(0, idx),
+                "root_quat_wxyz": self._ref_root_quat_wxyz.index_select(0, idx),
+                "root_lin_vel": self._ref_root_lin_vel.index_select(0, idx),
+                "root_ang_vel": self._ref_root_ang_vel.index_select(0, idx),
+                "joints": self._ref_joints.index_select(0, idx),
+                "joint_vel": self._ref_joint_vel.index_select(0, idx),
+            }
+
+        # Fallback (lazy loading / no pre-stack)
+        ref_joint_pos, ref_joint_vel = [], []
+        ref_root_pos, ref_root_quat = [], []
+        ref_root_lin_vel, ref_root_ang_vel = [], []
+
+        for env_id in range(self.num_envs):
+            fi = int(idx[env_id].item())
+            frame = self.dataset[fi]
+            ref_joint_pos.append(frame["joints"])
+            ref_joint_vel.append(frame["joint_vel"])
+            ref_root_pos.append(frame["root_pos"])
+            ref_root_quat.append(frame["root_quat_wxyz"])
+            ref_root_lin_vel.append(frame["root_lin_vel"])
+            ref_root_ang_vel.append(frame["root_ang_vel"])
+
+        return {
+            "root_pos": torch.stack(ref_root_pos, dim=0).to(self.device),
+            "root_quat_wxyz": torch.stack(ref_root_quat, dim=0).to(self.device),
+            "root_lin_vel": torch.stack(ref_root_lin_vel, dim=0).to(self.device),
+            "root_ang_vel": torch.stack(ref_root_ang_vel, dim=0).to(self.device),
+            "joints": torch.stack(ref_joint_pos, dim=0).to(self.device),
+            "joint_vel": torch.stack(ref_joint_vel, dim=0).to(self.device),
+        }
+
+    # -------------------------------------------------------------------------
+    # IsaacLab hooks
+    # -------------------------------------------------------------------------
 
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot_cfg)
-        # add ground plane
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
-        # clone and replicate
+
         self.scene.clone_environments(copy_from_source=False)
-        # we need to explicitly filter collisions for CPU simulation
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[])
-        # add articulation to scene
+
         self.scene.articulations["robot"] = self.robot
-        # add lights
+
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
@@ -99,100 +201,99 @@ class G1HybridGymEnv(DirectRLEnv):
 
         actions = self.actions.to(self.device)
         scaled_actions = actions * self.cfg.action_scale
-        joint_pos = self.robot.data.joint_pos[:, self.dataset_to_isaac_indexes]
 
-        target_joint_pos = joint_pos + scaled_actions
+        joint_pos = self.robot.data.joint_pos[:, self.dataset_to_isaac_indexes]  # (N,J)
+        target_joint_pos = joint_pos + scaled_actions  # (N,J)
+
+        # joint_ids is (J,1) => Isaac expects target (N,J,1)
         target_joint_pos = target_joint_pos.unsqueeze(-1)
 
         self.robot.set_joint_position_target(
-            target_joint_pos,
-            joint_ids=self._g1_dof_idx,
+            target_joint_pos, joint_ids=self._g1_dof_idx
         )
 
     def _get_observations(self) -> dict:
-        root_state = self.robot.data.root_state_w
-        root_pos = root_state[:, 0:3]
-        root_rot = root_state[:, 3:7] 
-        root_lin_vel = root_state[:, 7:10]
-        root_ang_vel = root_state[:, 10:13]
+        # IMPORTANT:
+        # - root_state_w is HYBRID (pose = link, vel = COM) -> NOT what we want.
+        # - root_link_state_w is CONSISTENT (pose+vel = link actor frame, all in WORLD).
+        root_link_state = self.robot.data.root_link_state_w  # (N,13)
+        root_pos_w = root_link_state[:, 0:3]
+        root_quat_wxyz = quat_normalize(root_link_state[:, 3:7])  # (N,4) wxyz
 
-        env_origins = self.scene.env_origins  
-        root_char_pos = root_pos - env_origins
-        h = root_char_pos[:, 2:3]
+        v_link_world = root_link_state[:, 7:10]  # (N,3) WORLD
+        w_link_world = root_link_state[:, 10:13]  # (N,3) WORLD
 
-        joint_full_pos = self.robot.data.joint_pos
-        joint_full_vel = self.robot.data.joint_vel
-        joint_pos = joint_full_pos[:, self.dataset_to_isaac_indexes]
-        joint_vel = joint_full_vel[:, self.dataset_to_isaac_indexes]
+        # Initialize "prev quat" buffer at first call
+        if self._prev_root_quat_wxyz is None:
+            self._prev_root_quat_wxyz = root_quat_wxyz.clone()
 
+        # Express current sim velocities in (prev) BODY axes to match dataset convention
+        q_prev = quat_normalize(self._prev_root_quat_wxyz)
+        root_lin_vel_body = quat_rotate_inv(q_prev, v_link_world)  # (N,3) BODY(prev)
+        root_ang_vel_body = quat_rotate_inv(q_prev, w_link_world)  # (N,3) BODY(prev)
+
+        # Update prev orientation for next step
+        self._prev_root_quat_wxyz = root_quat_wxyz.clone()
+
+        # Height wrt env origin
+        env_origins = self.scene.env_origins
+        h = (root_pos_w - env_origins)[:, 2:3]  # (N,1)
+
+        # Joint state in dataset order
+        joint_pos = self.robot.data.joint_pos[:, self.dataset_to_isaac_indexes]
+        joint_vel = self.robot.data.joint_vel[:, self.dataset_to_isaac_indexes]
+
+        # Current state (cur): BODY velocities + quaternion wxyz
         s_cur = torch.cat(
-            (h, root_rot, root_lin_vel, root_ang_vel, joint_pos, joint_vel),
+            (
+                h,
+                root_quat_wxyz,
+                root_lin_vel_body,
+                root_ang_vel_body,
+                joint_pos,
+                joint_vel,
+            ),
             dim=-1,
         )
 
-        ref_joint_pos = []
-        ref_joint_vel = []
-        ref_root_pos = []
-        ref_root_quat = []
-        ref_root_lin_vel = []
-        ref_root_ang_vel = []
+        # Reference state (ref): dataset already stores BODY velocities
+        self.ref_frame_idx.clamp_(0, self.max_frame_idx)
+        ref = self._get_ref_batch(self.ref_frame_idx)
 
-        for env_id in range(self.num_envs):
-            frame_idx = int(self.ref_frame_idx[env_id].item())
-            frame = self.dataset[frame_idx]
-            ref_joint_pos.append(frame["joints"])
-            ref_joint_vel.append(frame["joint_vel"])
-            ref_root_pos.append(frame["root_pos"])
-            ref_root_quat.append(frame["root_quat_wxyz"])
-            ref_root_lin_vel.append(frame["root_lin_vel"])
-            ref_root_ang_vel.append(frame["root_ang_vel"])
+        self._cached_ref_joint_pos = ref["joints"]
+        self._cached_ref_joint_vel = ref["joint_vel"]
 
-        ref_joint_pos = torch.stack(ref_joint_pos, dim=0).to(self.device)
-        ref_joint_vel = torch.stack(ref_joint_vel, dim=0).to(self.device)
-        ref_root_pos = torch.stack(ref_root_pos, dim=0).to(self.device)
-        ref_root_quat = torch.stack(ref_root_quat, dim=0).to(self.device)
-        ref_root_lin_vel = torch.stack(ref_root_lin_vel, dim=0).to(self.device)
-        ref_root_ang_vel = torch.stack(ref_root_ang_vel, dim=0).to(self.device)
-
-        h_ref = ref_root_pos[:, 2:3]
-
+        h_ref = ref["root_pos"][:, 2:3]
         s_ref = torch.cat(
             (
                 h_ref,
-                ref_root_quat,
-                ref_root_lin_vel,
-                ref_root_ang_vel,
-                ref_joint_pos,
-                ref_joint_vel,
+                ref["root_quat_wxyz"],
+                ref["root_lin_vel"],
+                ref["root_ang_vel"],
+                ref["joints"],
+                ref["joint_vel"],
             ),
             dim=-1,
         )
 
         obs = torch.cat((s_cur, s_ref), dim=-1)
-
-        alive = ~self.reset_buf
-        self.ref_frame_idx[alive] += 1
-        self.ref_frame_idx.clamp_(0, self.max_frame_idx)
-
         return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
         joint_pos = self.robot.data.joint_pos[:, self.dataset_to_isaac_indexes]
         joint_vel = self.robot.data.joint_vel[:, self.dataset_to_isaac_indexes]
-        ref_joint_pos = []
-        ref_joint_vel = []
-        for env_id in range(self.num_envs):
-            frame_idx = int(self.ref_frame_idx[env_id].item())
-            frame = self.dataset[frame_idx]
-            ref_joint_pos.append(frame["joints"])
-            ref_joint_vel.append(frame["joint_vel"])
 
-        ref_joint_pos = torch.stack(ref_joint_pos, dim=0).to(self.device)
-        ref_joint_vel = torch.stack(ref_joint_vel, dim=0).to(self.device)
-
-        # pose_error = torch.mean(torch.abs(joint_pos - ref_joint_pos)).item()
-        # vel_error  = torch.mean(torch.abs(joint_vel - ref_joint_vel)).item()
-        # print(f"mean |pose error| per joint: {pose_error:.4f}, |vel error|: {vel_error:.4f}")
+        if (
+            self._cached_ref_joint_pos is not None
+            and self._cached_ref_joint_vel is not None
+        ):
+            ref_joint_pos = self._cached_ref_joint_pos
+            ref_joint_vel = self._cached_ref_joint_vel
+        else:
+            self.ref_frame_idx.clamp_(0, self.max_frame_idx)
+            ref = self._get_ref_batch(self.ref_frame_idx)
+            ref_joint_pos = ref["joints"]
+            ref_joint_vel = ref["joint_vel"]
 
         total_reward = compute_rewards(
             self.cfg.rew_w_pose,
@@ -204,15 +305,23 @@ class G1HybridGymEnv(DirectRLEnv):
             ref_joint_vel,
             self.reset_terminated,
         )
+
+        # Advance reference index for envs still alive
+        alive = ~self.reset_buf
+        self.ref_frame_idx[alive] += 1
+        overflow = self.ref_frame_idx > self.max_frame_idx
+        self.ref_frame_idx[overflow] = 0
+
+        # Clear cache (rebuilt next obs)
+        self._cached_ref_joint_pos = None
+        self._cached_ref_joint_vel = None
+
         return total_reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
-        root_pos_z = self.robot.data.root_state_w[:, 2]
-        fallen = root_pos_z < self.cfg.min_height_reset
-
+        fallen = self.robot.data.root_link_state_w[:, 2] < self.cfg.min_height_reset
         terminated = fallen
-
         return terminated, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
@@ -222,49 +331,97 @@ class G1HybridGymEnv(DirectRLEnv):
 
         super()._reset_idx(env_ids)
 
-        device = self.device
+        # Reset reference timeline for these envs
         self.ref_frame_idx[env_ids] = 0
 
-        # stato di default
-        default_root_state = self.robot.data.default_root_state[env_ids].clone()
+        default_root_state = self.robot.data.default_root_state[
+            env_ids
+        ].clone()  # (n,13)
         default_joint_pos = self.robot.data.default_joint_pos[env_ids].clone()
         default_joint_vel = self.robot.data.default_joint_vel[env_ids].clone()
 
-        # origins delle env
         env_origins = self.scene.env_origins[env_ids]
-        # applica frame LAFAN a root + joint
-        frame = self.dataset[0]
-        for i in range(env_ids.shape[0]):
-            # frame_idx = int(self.ref_frame_idx[env_id].item())
-            # estraggo root pose, orient e vel dal dataset
-            root_pos = frame["root_pos"].to(device=device, dtype=torch.float32)
-            root_quat = frame["root_quat_wxyz"].to(device=device, dtype=torch.float32)
+        n = env_ids.shape[0]
 
-            root_lin_vel = frame["root_lin_vel"].to(device=device, dtype=torch.float32)
-            root_ang_vel = frame["root_ang_vel"].to(device=device, dtype=torch.float32)
+        # Read frame 0 from dataset (or stacked tensors)
+        if self._ref_root_pos is not None:
+            root_pos_0 = self._ref_root_pos[0].to(dtype=torch.float32)  # (3,)
+            root_quat_0 = quat_normalize(
+                self._ref_root_quat_wxyz[0].to(dtype=torch.float32)
+            )  # (4,)
+            root_lin_vel_0_body = self._ref_root_lin_vel[0].to(
+                dtype=torch.float32
+            )  # (3,) BODY
+            root_ang_vel_0_body = self._ref_root_ang_vel[0].to(
+                dtype=torch.float32
+            )  # (3,) BODY
+            joints_0 = self._ref_joints[0].to(dtype=torch.float32)  # (J,)
+            joint_vel_0 = self._ref_joint_vel[0].to(dtype=torch.float32)  # (J,)
+        else:
+            frame0 = self.dataset[0]
+            root_pos_0 = frame0["root_pos"].to(device=self.device, dtype=torch.float32)
+            root_quat_0 = quat_normalize(
+                frame0["root_quat_wxyz"].to(device=self.device, dtype=torch.float32)
+            )
+            root_lin_vel_0_body = frame0["root_lin_vel"].to(
+                device=self.device, dtype=torch.float32
+            )
+            root_ang_vel_0_body = frame0["root_ang_vel"].to(
+                device=self.device, dtype=torch.float32
+            )
+            joints_0 = frame0["joints"].to(device=self.device, dtype=torch.float32)
+            joint_vel_0 = frame0["joint_vel"].to(
+                device=self.device, dtype=torch.float32
+            )
 
-            ##Idem per joints
-            joints = frame["joints"].to(device=device, dtype=torch.float32)
-            joint_vel = frame["joint_vel"].to(device=device, dtype=torch.float32)
+        # Expand per-env
+        q0 = root_quat_0.view(1, 4).expand(n, 4)  # (n,4)
 
-            # Sovrascrivo la root pos/rot di default con root pos + offsettata dall'origine dell'env
-            default_root_state[i, 0:3] = root_pos + env_origins[i]
-            default_root_state[i, 3:7] = root_quat
+        # Dataset velocities are BODY and (by your checks) correspond to the LINK point.
+        v_link_w = quat_rotate(q0, root_lin_vel_0_body.view(1, 3).expand(n, 3))  # (n,3)
+        w_w = quat_rotate(q0, root_ang_vel_0_body.view(1, 3).expand(n, 3))  # (n,3)
 
-            # root vel
-            default_root_state[i, 7:10] = root_lin_vel
-            default_root_state[i, 10:13] = root_ang_vel
+        # PhysX "root velocities" are COM velocities.
+        # Convert link-point vel -> COM vel:
+        # v_link = v_com + ω × (p_link - p_com)  =>  v_com = v_link + ω × (p_com - p_link)
+        r_body = self.robot.data.body_com_pos_b[
+            env_ids, 0
+        ]  # (n,3) = (p_com - p_link) in LINK frame
+        r_w = quat_rotate(q0, r_body)  # (n,3) in WORLD
+        v_com_w = v_link_w + torch.linalg.cross(w_w, r_w, dim=-1)
 
-            # joints solo sui DOF tracciati
-            default_joint_pos[i, self.dataset_to_isaac_indexes] = joints
-            default_joint_vel[i, self.dataset_to_isaac_indexes] = joint_vel
+        # Write pose (LINK) + COM velocities (WORLD) as expected by IsaacLab buffers
+        default_root_state[:, 0:3] = root_pos_0.view(1, 3) + env_origins
+        default_root_state[:, 3:7] = q0
+        default_root_state[:, 7:10] = v_com_w
+        default_root_state[:, 10:13] = w_w
 
-        # applica allo stato della simulazione
+        # Set joints
+        default_joint_pos[:, self.dataset_to_isaac_indexes] = joints_0.view(
+            1, -1
+        ).expand(n, -1)
+        default_joint_vel[:, self.dataset_to_isaac_indexes] = joint_vel_0.view(
+            1, -1
+        ).expand(n, -1)
+
+        # Write to sim
         self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self.robot.write_joint_state_to_sim(
             default_joint_pos, default_joint_vel, None, env_ids
         )
+
+        # Init/update prev-quat buffer for BODY projection
+        if self._prev_root_quat_wxyz is None:
+            self._prev_root_quat_wxyz = torch.zeros(
+                (self.num_envs, 4), device=self.device, dtype=q0.dtype
+            )
+            # fill with something valid
+            self._prev_root_quat_wxyz[:] = quat_normalize(
+                self.robot.data.root_link_pose_w[:, 3:7]
+            )
+
+        self._prev_root_quat_wxyz[env_ids] = q0
 
 
 @torch.jit.script
@@ -278,13 +435,13 @@ def compute_rewards(
     ref_joint_vel: torch.Tensor,
     reset_terminated: torch.Tensor,
 ) -> torch.Tensor:
-
     pose_error = torch.sum(torch.square(joint_pos - ref_joint_pos), dim=-1)
     vel_error = torch.sum(torch.square(joint_vel - ref_joint_vel), dim=-1)
+
     rew_pose = -rew_w_pose * pose_error
     rew_vel = -rew_w_vel * vel_error
-    rew_alive = rew_alive * torch.ones_like(rew_pose)
-    rew_alive_term = rew_alive * (1.0 - reset_terminated.float())
-    total_reward = rew_pose + rew_vel + rew_alive_term
 
-    return total_reward
+    alive_bonus = rew_alive * torch.ones_like(rew_pose)
+    alive_bonus = alive_bonus * (1.0 - reset_terminated.float())
+
+    return rew_pose + rew_vel + alive_bonus

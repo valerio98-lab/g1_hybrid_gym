@@ -77,7 +77,6 @@ class ExpertLowLevelPolicy(ModelA2CContinuousLogStd):
             goal = obs_full[..., state_dim:]  # s_ref
 
             mu, log_std, value = self.a2c_network(obs, goal)
-            value = value.squeeze(-1)
             sigma = torch.exp(log_std)
 
             distr = torch.distributions.Normal(mu, sigma, validate_args=False)
@@ -100,7 +99,7 @@ class ExpertLowLevelPolicy(ModelA2CContinuousLogStd):
                 action = distr.sample()
                 neglogp = self.neglogp(action, mu, sigma, log_std)
                 return {
-                    "neglopacs": torch.squeeze(neglogp),
+                    "neglogpacs": torch.squeeze(neglogp),
                     "values": self.denorm_value(value),
                     "actions": action,
                     "rnn_states": None,
