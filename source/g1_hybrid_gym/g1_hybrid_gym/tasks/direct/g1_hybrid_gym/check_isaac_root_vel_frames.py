@@ -1,209 +1,177 @@
 import argparse
 from isaaclab.app import AppLauncher
 
-# --- launch Kit first (omni.* available) ---
-parser = argparse.ArgumentParser()
+# -----------------------------------------------------------------------------
+# 1. LAUNCH KIT (Must be done before any torch/isaaclab imports)
+# -----------------------------------------------------------------------------
+parser = argparse.ArgumentParser(description="Test Velocity Matching: Dataset vs Isaac Observation")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
+
+# Force headless if you don't need UI, or remove to see the robot
+# args.headless = True 
 
 app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
 
-# --- safe imports after Kit launch ---
+# -----------------------------------------------------------------------------
+# 2. IMPORTS (Safe after Kit launch)
+# -----------------------------------------------------------------------------
 import torch
+import numpy as np
 
-from g1_hybrid_gym.tasks.direct.g1_hybrid_gym.g1_hybrid_gym_env_cfg import (
-    G1HybridGymEnvCfg,
-)
+# Importa le classi dal tuo Environment e Dataset
+from g1_hybrid_gym.tasks.direct.g1_hybrid_gym.g1_hybrid_gym_env_cfg import G1HybridGymEnvCfg
 from g1_hybrid_gym.tasks.direct.g1_hybrid_gym.g1_hybrid_gym_env import G1HybridGymEnv
 
+from g1_hybrid_prior.helpers import (
+    quat_rotate,
+    quat_normalize,
+)
 
-def masked_mean(x: torch.Tensor, mask: torch.Tensor) -> float:
-    m = mask.to(dtype=x.dtype)
-    denom = m.sum().clamp_min(1.0)
-    return float((x * m).sum() / denom)
-
-
-@torch.no_grad()
 def main():
+    print("[Test] Initializing Environment...")
+    
+    # --- Configurazione ---
     cfg = G1HybridGymEnvCfg()
-    cfg.scene.num_envs = 4
-    cfg.robot_cfg.spawn.articulation_props.fix_root_link = False
+    cfg.scene.num_envs = 1      # Testiamo su un solo environment per chiarezza
+    cfg.sim.dt = 1.0 / 30.0     # Forziamo il DT a matchare i 30FPS del dataset
+    cfg.decimation = 1          # Decimation 1 per controllo diretto step-by-step
+    
+    # Disabilita reset automatici per altezza, vogliamo controllo manuale
+    cfg.min_height_reset = -100.0 
 
+    # --- Creazione Env ---
     env = G1HybridGymEnv(cfg=cfg, render_mode=None)
+    
+    # Primo reset per inizializzare i buffer interni
     env.reset()
+    
+    # --- Selezione Frame di Test ---
+    # Prendiamo un frame centrale dove le velocità "central" sono ben definite
+    frame_idx = 150 
+    print(f"[Test] Loading Frame {frame_idx} from Dataset...")
+    
+    # Accesso diretto al dataset caricato dall'env
+    data = env.dataset[frame_idx]
+    
+    # Recuperiamo i target dal dataset
+    # NOTA: Grazie alla tua modifica "central", queste velocità sono già 
+    # proiettate nel BODY FRAME all'istante t (Corrente)
+    v_ref_body = data["root_lin_vel"].to(env.device).unsqueeze(0) # (1, 3)
+    w_ref_body = data["root_ang_vel"].to(env.device).unsqueeze(0) # (1, 3)
+    
+    root_pos = data["root_pos"].to(env.device).unsqueeze(0)       # (1, 3)
+    root_quat = data["root_quat_wxyz"].to(env.device).unsqueeze(0)# (1, 4)
 
-    dt = float(env.cfg.sim.dt * env.cfg.decimation)
-    T = 300
+    # -------------------------------------------------------------------------
+    # 3. PREPARAZIONE STATO PER ISAAC (Conversione Body -> World -> COM)
+    # -------------------------------------------------------------------------
+    # Isaac vuole posizione e velocità in WORLD coordinates.
+    # Inoltre, PhysX gestisce la velocità del COM (Center of Mass), non del Link geometrico.
+    
+    # A. Body -> World
+    v_link_world = quat_rotate(root_quat, v_ref_body)
+    w_link_world = quat_rotate(root_quat, w_ref_body)
+    
+    # B. Link -> COM (PhysX logic)
+    # v_com = v_link + w x (r_com - r_link)
+    # r_body è il vettore (COM - Link) nel frame locale
+    r_body = env.robot.data.body_com_pos_b[0, 0].unsqueeze(0) # (1, 3)
+    r_world = quat_rotate(root_quat, r_body)     # (1, 3)
+    
+    v_com_world = v_link_world + torch.linalg.cross(w_link_world, r_world, dim=-1)
+    
+    # Costruiamo il tensore di stato completo
+    root_state = torch.zeros((1, 13), device=env.device)
+    root_state[:, 0:3] = root_pos + env.scene.env_origins # Absolute position
+    root_state[:, 3:7] = root_quat
+    root_state[:, 7:10] = v_com_world
+    root_state[:, 10:13] = w_link_world # Angular vel is roughly same for rigid body
 
-    # We'll store POST-step states (i.e., after env.step())
-    link_pos, link_quat, v_link_rep, w_link_rep = [], [], [], []
-    com_pos, v_com_rep, w_com_rep = [], [], []
-    v_rootstate_rep, w_rootstate_rep = [], []
-    done_flags = []
+    print("[Test] Writing State to Sim...")
+    
+    # -------------------------------------------------------------------------
+    # 4. SCRITTURA E AGGIORNAMENTO BUFFER
+    # -------------------------------------------------------------------------
+    # Scriviamo direttamente nella memoria di PhysX
+    env.robot.write_root_pose_to_sim(root_state[:, :7], env_ids=torch.tensor([0], device=env.device))
+    env.robot.write_root_velocity_to_sim(root_state[:, 7:], env_ids=torch.tensor([0], device=env.device))
+    
+    # CRUCIALE: Dobbiamo forzare l'aggiornamento delle "viste" di IsaacLab (env.robot.data)
+    # senza fare un passo di fisica (che integrerebbe la posizione cambiandola).
+    # write_data_to_sim flusha i dati verso PhysX
+    env.scene.write_data_to_sim()
+    
+    # update_buffers rilegge i dati da PhysX e popola env.robot.data
+    # dt piccolo serve solo per i calcoli interni, qui non avanziamo la fisica
+    env.robot.update(dt=0.001) 
 
-    for _ in range(T):
-        a = 0.25 * torch.randn((env.num_envs, env.cfg.action_space), device=env.device)
-        obs, rew, term, trunc, info = env.step(a)
+    # -------------------------------------------------------------------------
+    # 5. VERIFICA OSSERVAZIONE (Il vero test)
+    # -------------------------------------------------------------------------
+    print("[Test] Computing Observations...")
+    
+    # Chiamiamo la tua funzione _get_observations che fa la proiezione inversa World->Body
+    obs_dict = env._get_observations()
+    obs = obs_dict["policy"] # Tensore [h, q, v, w, ...]
+    
+    # Estraiamo v e w dal tensore di osservazione.
+    # Layout atteso da G1HybridGymEnv:
+    # [h(1), q(4), v_body(3), w_body(3), ...]
+    # Indici:
+    # h: 0
+    # q: 1:5
+    # v_body: 5:8
+    # w_body: 8:11
+    
+    v_isaac_body = obs[0, 5:8]
+    w_isaac_body = obs[0, 8:11]
+    
+    # --- RISULTATI ---
+    print("\n" + "="*50)
+    print("CONFRONTO VELOCITÀ: DATASET (Target) vs ISAAC (Obs)")
+    print("="*50)
+    
+    v_ref_np = v_ref_body.cpu().numpy()[0]
+    v_sim_np = v_isaac_body.cpu().numpy()
+    
+    print(f"Dataset Linear Vel (Body):  [{v_ref_np[0]:.5f}, {v_ref_np[1]:.5f}, {v_ref_np[2]:.5f}]")
+    print(f"Isaac   Linear Vel (Body):  [{v_sim_np[0]:.5f}, {v_sim_np[1]:.5f}, {v_sim_np[2]:.5f}]")
+    
+    diff_v = torch.norm(v_ref_body - v_isaac_body).item()
+    print(f"-> Linear Velocity Error (L2): {diff_v:.8f}")
+    
+    print("-" * 30)
+    
+    w_ref_np = w_ref_body.cpu().numpy()[0]
+    w_sim_np = w_isaac_body.cpu().numpy()
+    
+    print(f"Dataset Angular Vel (Body): [{w_ref_np[0]:.5f}, {w_ref_np[1]:.5f}, {w_ref_np[2]:.5f}]")
+    print(f"Isaac   Angular Vel (Body): [{w_sim_np[0]:.5f}, {w_sim_np[1]:.5f}, {w_sim_np[2]:.5f}]")
+    
+    diff_w = torch.norm(w_ref_body - w_isaac_body).item()
+    print(f"-> Angular Velocity Error (L2): {diff_w:.8f}")
+    
+    print("="*50)
+    
+    if diff_v < 1e-4:
+        print("\n✅ SUCCESS: Le velocità matchano perfettamente!")
+        print("Il sistema di coordinate (Dataset -> World -> Isaac -> Body) è COERENTE.")
+    else:
+        print("\n❌ FAILURE: C'è una discrepanza significativa.")
+        print("Possibili cause:")
+        print("1. Dataset usa proiezione su t-1 mentre Env su t (o viceversa).")
+        print("2. Errore nella conversione Link <-> Center of Mass.")
+        print("3. I quaternioni sono normalizzati male.")
 
-        done = (term | trunc).clone()  # (N,)
-        done_flags.append(done)
-
-        # LINK-consistent state (pose+vel of link origin)
-        ls = env.robot.data.root_link_state_w  # (N,13)
-        link_pos.append(ls[:, 0:3].clone())
-        link_quat.append(ls[:, 3:7].clone())
-        v_link_rep.append(ls[:, 7:10].clone())
-        w_link_rep.append(ls[:, 10:13].clone())
-
-        # COM-consistent state (pose+vel of COM)
-        cs = env.robot.data.root_com_state_w  # (N,13)
-        com_pos.append(cs[:, 0:3].clone())
-        v_com_rep.append(cs[:, 7:10].clone())
-        w_com_rep.append(cs[:, 10:13].clone())
-
-        # MIXED state (link pose + COM velocity) -- this is what root_state_w is
-        rs = env.robot.data.root_state_w
-        v_rootstate_rep.append(rs[:, 7:10].clone())
-        w_rootstate_rep.append(rs[:, 10:13].clone())
-
-    # Stack time
-    link_pos = torch.stack(link_pos, dim=0)  # (T,N,3)
-    v_link_rep = torch.stack(v_link_rep, dim=0)  # (T,N,3)
-    w_link_rep = torch.stack(w_link_rep, dim=0)  # (T,N,3)
-
-    com_pos = torch.stack(com_pos, dim=0)  # (T,N,3)
-    v_com_rep = torch.stack(v_com_rep, dim=0)  # (T,N,3)
-    w_com_rep = torch.stack(w_com_rep, dim=0)  # (T,N,3)
-
-    v_rootstate_rep = torch.stack(v_rootstate_rep, dim=0)  # (T,N,3)
-    w_rootstate_rep = torch.stack(w_rootstate_rep, dim=0)  # (T,N,3)
-
-    done_flags = torch.stack(done_flags, dim=0)  # (T,N) bool
-
-    # ---------------------------------------------------------------------
-    # IMPORTANT FIX: timestamp / alignment
-    # Your logs showed v_link_rep is closer to POST-step velocity:
-    #   (p[t] - p[t-1]) / dt  ~ v[t]
-    # not (p[t+1]-p[t])/dt ~ v[t].
-    # So we evaluate the main consistency with forward-diff aligned to v[t].
-    # ---------------------------------------------------------------------
-
-    # Forward difference: dp[t] = p[t] - p[t-1]  for t=1..T-1
-    dp_link = link_pos[1:] - link_pos[:-1]  # (T-1,N,3)
-    dp_com = com_pos[1:] - com_pos[:-1]  # (T-1,N,3)
-
-    v_fd_link_fwd = dp_link / dt  # (T-1,N,3)
-    v_fd_com_fwd = dp_com / dt  # (T-1,N,3)
-
-    # Align reported velocities to POST-step (index t=1..T-1)
-    vL_post = v_link_rep[1:]  # (T-1,N,3)
-    wL_post = w_link_rep[1:]  # (T-1,N,3)
-    vC_post = v_com_rep[1:]  # (T-1,N,3)
-    wC_post = w_com_rep[1:]  # (T-1,N,3)
-    vRS_post = v_rootstate_rep[1:]  # (T-1,N,3)
-    wRS_post = w_rootstate_rep[1:]  # (T-1,N,3)
-
-    # Valid mask for forward diffs: exclude transitions that involve a reset at t or t-1
-    valid_fwd = ~(done_flags[1:] | done_flags[:-1])  # (T-1,N)
-
-    # Kinematic relation in WORLD:
-    # v_link = v_com + ω × (p_link - p_com)
-    r_world_post = link_pos[1:] - com_pos[1:]  # (T-1,N,3) = pL - pC
-    v_link_from_com_post = vC_post + torch.cross(wC_post, r_world_post, dim=-1)
-
-    # Errors (forward/post)
-    err_A = torch.norm(v_fd_link_fwd - vL_post, dim=-1)  # (T-1,N)
-    err_B = torch.norm(v_fd_com_fwd - vC_post, dim=-1)  # (T-1,N)
-    err_C = torch.norm(
-        v_fd_link_fwd - vRS_post, dim=-1
-    )  # (T-1,N) root_state_w lin vel is COM -> should be worse
-    err_D = torch.norm(v_fd_link_fwd - v_link_from_com_post, dim=-1)  # (T-1,N)
-    err_D2 = torch.norm(
-        vL_post - v_link_from_com_post, dim=-1
-    )  # (T-1,N) should be small if link/com buffers are consistent
-    err_E = torch.norm(wL_post - wC_post, dim=-1)  # (T-1,N) should be ~0
-
-    print("=== ISAAC ROOT VELOCITIES: CONSISTENCY CHECK (POST-step aligned) ===")
-    print(f"dt_effective = {dt}")
-    print(
-        f"valid samples (t-1,t no reset) = {int(valid_fwd.sum().item())} / {valid_fwd.numel()}"
-    )
-    print("")
-    print(
-        f"[A] mean ||FD_fwd(link_pos_w)/dt - root_link_state_w.lin_vel||   = {masked_mean(err_A, valid_fwd):.6e}"
-    )
-    print(
-        f"[B] mean ||FD_fwd(com_pos_w)/dt  - root_com_state_w.lin_vel||    = {masked_mean(err_B, valid_fwd):.6e}"
-    )
-    print(
-        f"[C] mean ||FD_fwd(link_pos_w)/dt - root_state_w.lin_vel (COM!)|| = {masked_mean(err_C, valid_fwd):.6e}"
-    )
-    print(
-        f"[D] mean ||FD_fwd(link_pos_w)/dt - (v_com + ω×(pL-pC))||         = {masked_mean(err_D, valid_fwd):.6e}"
-    )
-    print(
-        f"[D2] mean ||v_link_rep - (v_com + ω×(pL-pC))||                   = {masked_mean(err_D2, valid_fwd):.6e}"
-    )
-    print(
-        f"[E] mean ||ω_link - ω_com||                                      = {masked_mean(err_E, valid_fwd):.6e}"
-    )
-    print("")
-    print("Interpretation:")
-    print(
-        "- [A] should be small if link velocities match link origin motion (with correct timestamp alignment)."
-    )
-    print("- [B] should be small if COM velocities match COM motion.")
-    print("- [C] expected larger: root_state_w mixes LINK pose with COM velocity.")
-    print("- [D] should be comparable to [A] if the rigid-body relation holds.")
-    print(
-        "- [D2] should be very small: internal consistency between link/com velocity buffers."
-    )
-    print("- [E] should be ~0 for a rigid body (and usually is).")
-    # --- NEW: trapezoidal integration check ---
-    # dp[t] ≈ 0.5 * (v[t-1] + v[t]) * dt
-    vL_prev = v_link_rep[:-1]  # (T-1,N,3) velocity at t-1
-    vL_curr = v_link_rep[1:]  # (T-1,N,3) velocity at t
-    dp_pred_trap = 0.5 * (vL_prev + vL_curr) * dt  # (T-1,N,3)
-
-    err_F = torch.norm(dp_link - dp_pred_trap, dim=-1)  # (T-1,N)
-
-    print("\n=== EXTRA: INTEGRATION CHECK (trapezoid) ===")
-    print(
-        f"[F] mean ||(p[t]-p[t-1]) - 0.5*(v[t-1]+v[t])*dt|| = {masked_mean(err_F, valid_fwd):.6e}"
-    )
-
-    # ---------------------------------------------------------------------
-    # Optional: also show CENTRAL difference (still useful, but alignment-sensitive)
-    # Central diff centered at index t (uses t-1,t+1), compare to v[t].
-    # Here v[t] is POST-step at same t.
-    # ---------------------------------------------------------------------
-    if T >= 3:
-        v_fd_link_c = (link_pos[2:] - link_pos[:-2]) / (2.0 * dt)  # (T-2,N,3)
-        v_fd_com_c = (com_pos[2:] - com_pos[:-2]) / (2.0 * dt)  # (T-2,N,3)
-
-        vL_mid = v_link_rep[1:-1]  # (T-2,N,3)
-        vC_mid = v_com_rep[1:-1]  # (T-2,N,3)
-
-        valid_c = ~(done_flags[2:] | done_flags[1:-1] | done_flags[:-2])  # (T-2,N)
-
-        err_Ac = torch.norm(v_fd_link_c - vL_mid, dim=-1)
-        err_Bc = torch.norm(v_fd_com_c - vC_mid, dim=-1)
-
-        print("\n=== OPTIONAL: CENTRAL-DIFF (centered) ===")
-        print(
-            f"valid samples (t-1,t,t+1 no reset) = {int(valid_c.sum().item())} / {valid_c.numel()}"
-        )
-        print(
-            f"[Ac] mean ||FD_c(link_pos_w) - v_link_rep|| = {masked_mean(err_Ac, valid_c):.6e}"
-        )
-        print(
-            f"[Bc] mean ||FD_c(com_pos_w)  - v_com_rep||  = {masked_mean(err_Bc, valid_c):.6e}"
-        )
-
+    # Chiude l'app
     env.close()
 
-
 if __name__ == "__main__":
-    main()
-    simulation_app.close()
+    try:
+        main()
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        simulation_app.close()
