@@ -35,17 +35,15 @@ class G1HybridGymEnv(DirectRLEnv):
     ):
         super().__init__(cfg, render_mode, **kwargs)
 
-        # --- Dataset ---
+        dataset_path = Path("/home/valerio/g1_hybrid_prior/data_raw/LAFAN1_Retargeting_Dataset/g1_ee_augmented")
         self.dataset = G1HybridPriorDataset(
-            file_path=Path(
-                "/home/valerio/g1_hybrid_prior/data_raw/LAFAN1_Retargeting_Dataset/g1_ee_augmented/dance1_subject2.csv"
-            ),
+            file_path=dataset_path,
             robot="g1",
             dataset_type="augmented",
-            lazy_load=False,
+            lazy_load=False,  
             vel_mode="central",
         )
-        print(f"[G1HybridGymEnv] Loaded dataset with {len(self.dataset)} frames")
+        print(f"[G1HybridGymEnv] Loaded AUGMENTED dataset with {len(self.dataset)} frames")
 
         dataset_joint_names = self.dataset.robot_cfg.joint_order
         isaac_joint_names = self.robot.joint_names
@@ -76,6 +74,20 @@ class G1HybridGymEnv(DirectRLEnv):
             g1_dof_idx, device=self.device, dtype=torch.long
         ).unsqueeze(-1)
 
+        # --- End-Effector Mapping (Isaac Indices) ---
+        # Cerchiamo gli indici dei body in Isaac che corrispondono agli EE del dataset
+        self.ee_names = self.dataset.robot_cfg.ee_link_names
+        self.ee_isaac_indices = []
+        
+        all_body_names = self.robot.body_names
+        for ee_name in self.ee_names:
+            if ee_name not in all_body_names:
+                raise ValueError(f"End-Effector Link '{ee_name}' not found in Isaac articulation bodies!")
+            self.ee_isaac_indices.append(all_body_names.index(ee_name))
+            
+        self.ee_isaac_indices = torch.tensor(self.ee_isaac_indices, device=self.device, dtype=torch.long)
+        print(f"[G1HybridGymEnv] Mapped End-Effectors: {self.ee_names} -> Indices {self.ee_isaac_indices.tolist()}")
+
         # Reference index per env
         self.ref_frame_idx = torch.zeros(
             self.num_envs, dtype=torch.long, device=self.device
@@ -84,16 +96,17 @@ class G1HybridGymEnv(DirectRLEnv):
 
         self.actions: torch.Tensor | None = None
 
-        # Caching reference tensors for reward calculation
+        # Caching reference tensors
         self._cached_ref_tensors: Dict[str, torch.Tensor] | None = None
 
-        # Pre-stacked reference tensors for fast indexing (if non-lazy)
+        # Pre-stacked reference tensors
         self._ref_root_pos: torch.Tensor | None = None
         self._ref_root_quat_wxyz: torch.Tensor | None = None
         self._ref_root_lin_vel: torch.Tensor | None = None
         self._ref_root_ang_vel: torch.Tensor | None = None
         self._ref_joints: torch.Tensor | None = None
         self._ref_joint_vel: torch.Tensor | None = None
+        self._ref_ee_pos: torch.Tensor | None = None  # Nuovo tensore per EE
 
         self._build_reference_tensors()
 
@@ -119,39 +132,29 @@ class G1HybridGymEnv(DirectRLEnv):
         self._ref_root_ang_vel = root_ang_vel.to(self.device)
         self._ref_joints = joints.to(self.device)
         self._ref_joint_vel = joint_vel.to(self.device)
+        
+        # Stack EE pos (Se presente nel dataset)
+        if "ee_pos" in frames[0]:
+            self._ref_ee_pos = torch.stack([f["ee_pos"] for f in frames], dim=0).to(self.device)
 
     def _get_ref_batch(self, frame_idx: torch.Tensor) -> dict[str, torch.Tensor]:
         """Return a batched reference dict for given per-env frame indices."""
         idx = frame_idx.clamp(0, self.max_frame_idx)
 
-        if self._ref_joints is not None:
-            return {
-                "root_pos": self._ref_root_pos.index_select(0, idx),
-                "root_quat_wxyz": self._ref_root_quat_wxyz.index_select(0, idx),
-                "root_lin_vel": self._ref_root_lin_vel.index_select(0, idx),
-                "root_ang_vel": self._ref_root_ang_vel.index_select(0, idx),
-                "joints": self._ref_joints.index_select(0, idx),
-                "joint_vel": self._ref_joint_vel.index_select(0, idx),
-            }
-
-        # Fallback (lazy loading)
-        batch_data = {
-            "root_pos": [], "root_quat_wxyz": [], 
-            "root_lin_vel": [], "root_ang_vel": [],
-            "joints": [], "joint_vel": []
+        batch = {
+            "root_pos": self._ref_root_pos.index_select(0, idx),
+            "root_quat_wxyz": self._ref_root_quat_wxyz.index_select(0, idx),
+            "root_lin_vel": self._ref_root_lin_vel.index_select(0, idx),
+            "root_ang_vel": self._ref_root_ang_vel.index_select(0, idx),
+            "joints": self._ref_joints.index_select(0, idx),
+            "joint_vel": self._ref_joint_vel.index_select(0, idx),
         }
-
-        for env_id in range(self.num_envs):
-            fi = int(idx[env_id].item())
-            frame = self.dataset[fi]
-            batch_data["root_pos"].append(frame["root_pos"])
-            batch_data["root_quat_wxyz"].append(frame["root_quat_wxyz"])
-            batch_data["root_lin_vel"].append(frame["root_lin_vel"])
-            batch_data["root_ang_vel"].append(frame["root_ang_vel"])
-            batch_data["joints"].append(frame["joints"])
-            batch_data["joint_vel"].append(frame["joint_vel"])
-
-        return {k: torch.stack(v, dim=0).to(self.device) for k, v in batch_data.items()}
+        
+        # Aggiungi EE se disponibile
+        if self._ref_ee_pos is not None:
+            batch["ee_pos"] = self._ref_ee_pos.index_select(0, idx)
+            
+        return batch
 
     def _build_goal_from_ref(
         self,
@@ -163,10 +166,7 @@ class G1HybridGymEnv(DirectRLEnv):
         joint_vel: torch.Tensor,
         ref: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        """
-        Calcola l'errore tra stato corrente e riferimento.
-        Tutto proiettato nel Frame Corrente del Robot (t).
-        """
+        """Calcola l'errore tra stato corrente e riferimento (osservazione)."""
         # --- height error ---
         h_ref = ref["root_pos"][:, 2:3]
         dh = h_ref - h_cur
@@ -178,18 +178,15 @@ class G1HybridGymEnv(DirectRLEnv):
         q_err = quat_normalize(q_err)
 
         # --- velocities ---
-        # 1. Dataset Vel: BODY(ref) -> WORLD
         v_ref_body_ref = ref["root_lin_vel"]
         w_ref_body_ref = ref["root_ang_vel"]
         
         v_ref_world = quat_rotate(q_ref, v_ref_body_ref)
         w_ref_world = quat_rotate(q_ref, w_ref_body_ref)
 
-        # 2. WORLD -> BODY(sim_current)
         v_ref_body_sim = quat_rotate_inv(q_cur, v_ref_world)
         w_ref_body_sim = quat_rotate_inv(q_cur, w_ref_world)
 
-        # 3. Delta
         dv = v_ref_body_sim - v_cur_body
         dw = w_ref_body_sim - w_cur_body
 
@@ -232,47 +229,31 @@ class G1HybridGymEnv(DirectRLEnv):
         )
 
     def _get_observations(self) -> dict:
-        # Use link-consistent state (pose+vel in WORLD for the link frame)
         root_link_state = self.robot.data.root_link_state_w  # (N,13)
         root_pos_w = root_link_state[:, 0:3]
         root_quat_wxyz = quat_normalize(root_link_state[:, 3:7])  # (N,4)
 
-        v_link_world = root_link_state[:, 7:10]     # (N,3) WORLD
-        w_link_world = root_link_state[:, 10:13]    # (N,3) WORLD
+        v_link_world = root_link_state[:, 7:10]
+        w_link_world = root_link_state[:, 10:13]
 
-        # Proiezione su Frame Corrente (t)
         root_lin_vel_body = quat_rotate_inv(root_quat_wxyz, v_link_world)
         root_ang_vel_body = quat_rotate_inv(root_quat_wxyz, w_link_world)
 
-        # Height wrt env origin
         env_origins = self.scene.env_origins
         h = (root_pos_w - env_origins)[:, 2:3]
 
-        # Joint state in dataset order
         joint_pos = self.robot.data.joint_pos[:, self.dataset_to_isaac_indexes]
         joint_vel = self.robot.data.joint_vel[:, self.dataset_to_isaac_indexes]
 
-        # Current state (cur)
         s_cur = torch.cat(
-            (
-                h,
-                root_quat_wxyz,
-                root_lin_vel_body,
-                root_ang_vel_body,
-                joint_pos,
-                joint_vel,
-            ),
+            (h, root_quat_wxyz, root_lin_vel_body, root_ang_vel_body, joint_pos, joint_vel),
             dim=-1,
         )
 
-        # Reference frame for this step
         self.ref_frame_idx.clamp_(0, self.max_frame_idx)
         ref = self._get_ref_batch(self.ref_frame_idx)
-        
-        # Cache for Reward calculation
         self._cached_ref_tensors = ref
 
-        # Goal Calculation
         goal = self._build_goal_from_ref(
             h_cur=h,
             q_cur_wxyz=root_quat_wxyz,
@@ -287,13 +268,25 @@ class G1HybridGymEnv(DirectRLEnv):
         return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
+        # Dati Robot Correnti
         joint_pos = self.robot.data.joint_pos[:, self.dataset_to_isaac_indexes]
         joint_vel = self.robot.data.joint_vel[:, self.dataset_to_isaac_indexes]
         
+        # Root state relativo all'origine dell'env
         root_link_state = self.robot.data.root_link_state_w
         root_pos_w = root_link_state[:, 0:3] - self.scene.env_origins 
         root_quat_w = quat_normalize(root_link_state[:, 3:7])
 
+        # End-Effector State Corrente (Robot)
+        # body_state_w: (num_envs, num_bodies, 13)
+        # Estraiamo solo i body delle mani/piedi usando gli indici mappati
+        # Risultato: (N, 4, 3)
+        ee_state_w = self.robot.data.body_state_w[:, self.ee_isaac_indices, 0:3]
+        # Shiftiamo anche questo all'origine dell'env per confrontarlo col dataset
+        # env_origins è (N, 3), lo espandiamo a (N, 1, 3) per broadcasting
+        ee_pos_rel = ee_state_w - self.scene.env_origins.unsqueeze(1)
+
+        # Dati Reference
         if self._cached_ref_tensors is not None:
             ref = self._cached_ref_tensors
         else:
@@ -303,21 +296,18 @@ class G1HybridGymEnv(DirectRLEnv):
         total_reward = compute_rewards(
             self.cfg.rew_w_pose,
             self.cfg.rew_w_vel,
-            self.cfg.rew_w_root_pos,  # Assicurati di aver aggiunto questo nel Cfg
-            self.cfg.rew_w_root_rot,  # Assicurati di aver aggiunto questo nel Cfg
+            self.cfg.rew_w_root_pos,
+            self.cfg.rew_w_root_rot,
+            self.cfg.rew_w_ee,
             self.cfg.rew_alive,
-            joint_pos,
-            joint_vel,
-            root_pos_w,
-            root_quat_w,
-            ref["joints"],
-            ref["joint_vel"],
-            ref["root_pos"],
-            ref["root_quat_wxyz"],
+            # Current Robot State
+            joint_pos, joint_vel, root_pos_w, root_quat_w, ee_pos_rel,
+            # Reference State
+            ref["joints"], ref["joint_vel"], ref["root_pos"], ref["root_quat_wxyz"], ref.get("ee_pos"),
+            # Flags
             self.reset_terminated,
         )
 
-        # Advance reference index
         alive = ~self.reset_buf
         self.ref_frame_idx[alive] += 1
         overflow = self.ref_frame_idx > self.max_frame_idx
@@ -340,16 +330,13 @@ class G1HybridGymEnv(DirectRLEnv):
         super()._reset_idx(env_ids)
         n = len(env_ids)
 
-        # --- RANDOM START (Cruciale per training) ---
-        # Campioniamo un frame casuale per ogni environment
-        # Lasciamo almeno 60 frame (2s) di margine prima della fine della clip
+        # --- RANDOM START (RSI) ---
         min_episode_frames = 60
         max_start = max(0, self.max_frame_idx - min_episode_frames)
         random_starts = torch.randint(0, max_start + 1, (n,), device=self.device)
         self.ref_frame_idx[env_ids] = random_starts
 
         if self._ref_root_pos is not None:
-            # Fast batch indexing
             root_pos_0 = self._ref_root_pos[random_starts]
             root_quat_0 = self._ref_root_quat_wxyz[random_starts]
             root_lin_vel_0_body = self._ref_root_lin_vel[random_starts]
@@ -359,27 +346,20 @@ class G1HybridGymEnv(DirectRLEnv):
         else:
             # Fallback lazy load
             frame0 = self.dataset[0] 
-            # (Nota: Per semplicità in lazy load si usa spesso frame 0 o si fa un loop, 
-            # ma dato che hai lazy_load=False userà sempre il blocco if sopra)
             root_pos_0 = frame0["root_pos"].to(self.device).repeat(n, 1)
-            # ... (codice lazy completo omesso per brevità, tanto usi pre-stack)
+            # (logica lazy completa omessa per brevità dato che usi pre-stack)
 
-        # Setup Simulation State
         env_origins = self.scene.env_origins[env_ids]
         root_pos_w = root_pos_0 + env_origins
         root_quat_w = quat_normalize(root_quat_0)
 
-        # Velocità: Dataset(Link, Body) -> World -> COM
-        # 1. Ruota vel body nel mondo
+        # Velocità: Body -> World -> COM
         v_link_w = quat_rotate(root_quat_w, root_lin_vel_0_body)
         w_w = quat_rotate(root_quat_w, root_ang_vel_0_body)
-
-        # 2. Correggi per il centro di massa (COM)
         r_body = self.robot.data.body_com_pos_b[env_ids, 0]
         r_w = quat_rotate(root_quat_w, r_body)
         v_com_w = v_link_w + torch.linalg.cross(w_w, r_w, dim=-1)
 
-        # Create State Tensors
         default_root_state = self.robot.data.default_root_state[env_ids].clone()
         default_root_state[:, 0:3] = root_pos_w
         default_root_state[:, 3:7] = root_quat_w
@@ -392,7 +372,6 @@ class G1HybridGymEnv(DirectRLEnv):
         default_joint_pos[:, self.dataset_to_isaac_indexes] = joints_0
         default_joint_vel[:, self.dataset_to_isaac_indexes] = joint_vel_0
 
-        # Write to Sim
         self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self.robot.write_joint_state_to_sim(default_joint_pos, default_joint_vel, None, env_ids)
@@ -404,35 +383,63 @@ def compute_rewards(
     rew_w_vel: float,
     rew_w_root_pos: float,
     rew_w_root_rot: float,
+    rew_w_ee: float,
     rew_alive: float,
     # Current
     joint_pos: torch.Tensor,
     joint_vel: torch.Tensor,
     root_pos: torch.Tensor,
     root_quat: torch.Tensor,
+    ee_pos: torch.Tensor,
     # Ref
     ref_joint_pos: torch.Tensor,
     ref_joint_vel: torch.Tensor,
     ref_root_pos: torch.Tensor,
     ref_root_quat: torch.Tensor,
+    ref_ee_pos: torch.Tensor | None,
     # Flags
     reset_terminated: torch.Tensor,
 ) -> torch.Tensor:
     
-    pose_error = torch.sum(torch.square(joint_pos - ref_joint_pos), dim=-1)
-    vel_error = torch.sum(torch.square(joint_vel - ref_joint_vel), dim=-1)
-    root_pos_error = torch.sum(torch.square(root_pos - ref_root_pos), dim=-1)
+    # 1. Calcolo Errori Quadratici (L2^2)
+    # Pose joints
+    joint_pos_err = torch.sum(torch.square(joint_pos - ref_joint_pos), dim=-1)
+    # Velocity joints
+    joint_vel_err = torch.sum(torch.square(joint_vel - ref_joint_vel), dim=-1)
     
-    # Orientation error (1 - |dot|)
-    quat_dot = torch.sum(root_quat * ref_root_quat, dim=-1).abs()
-    quat_dot = torch.clamp(quat_dot, 0.0, 1.0)
-    root_rot_error = 1.0 - quat_dot
+    # Root position
+    root_pos_diff = root_pos - ref_root_pos
+    root_pos_err = torch.sum(torch.square(root_pos_diff), dim=-1)
+    
+    # Root rotation (1 - |dot|)
+    quat_dot = torch.sum(root_quat * ref_root_quat, dim=-1).abs().clamp(0.0, 1.0)
+    root_rot_err = 1.0 - quat_dot
 
-    rew_pose = -rew_w_pose * pose_error
-    rew_vel = -rew_w_vel * vel_error
-    rew_root_p = -rew_w_root_pos * root_pos_error
-    rew_root_r = -rew_w_root_rot * root_rot_error
+    # End-Effector Error
+    if ref_ee_pos is not None:
+        ee_diff = ee_pos - ref_ee_pos
+        # Errore quadro per ogni EE, sommato su XYZ -> (N, 4)
+        ee_sq_err = torch.sum(torch.square(ee_diff), dim=-1)
+        # Somma su tutti gli EE -> (N,)
+        ee_total_err = torch.sum(ee_sq_err, dim=-1)
+    else:
+        ee_total_err = torch.zeros_like(root_pos_err)
 
+    # 2. Kernel Esponenziali (Moltiplicativi)
+    # Usiamo i pesi passati dal config come coefficienti negativi per l'esponenziale
+    # Formula: exp(-weight * error)
+    
+    r_pose   = torch.exp(-rew_w_pose * joint_pos_err)
+    r_vel    = torch.exp(-rew_w_vel * joint_vel_err)
+    r_root_p = torch.exp(-rew_w_root_pos * root_pos_err)
+    r_root_r = torch.exp(-rew_w_root_rot * root_rot_err)
+    r_ee     = torch.exp(-rew_w_ee * ee_total_err)
+
+    # 3. Reward Totale
+    # Struttura moltiplicativa per l'imitazione: forza il rispetto di tutti i vincoli
+    imitation_reward = r_pose * r_vel * r_root_p * r_root_r * r_ee
+    
+    # Bonus sopravvivenza additivo (per gradienti stabili all'inizio)
     alive_bonus = rew_alive * (1.0 - reset_terminated.float())
 
-    return rew_pose + rew_vel + rew_root_p + rew_root_r + alive_bonus
+    return imitation_reward + alive_bonus

@@ -34,14 +34,21 @@ class G1HybridGymEnvCfg(DirectRLEnvCfg):
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=20, env_spacing=4.0, replicate_physics=True
+        num_envs=8192, env_spacing=4.0, replicate_physics=True
     )
 
     # - action scale
     action_scale = 1.0  # [N]
-    # - reward scales
-    rew_w_pose = 1.0
-    rew_w_vel = 0.01
-    rew_alive = 0.1
+    
+    # - reward scales (Coefficienti per l'esponenziale: exp(-w * err))
+    # Valori ispirati a DeepMimic / Paper Appendix B.2
+    rew_w_pose = 2.0        # Paper Eq.10: r_q uses -2
+    rew_w_vel = 0.5         # Paper Eq.10: r_alpha uses -0.5
+    rew_w_root_pos = 10.0   # Paper Eq.10: r_root uses -10
+    rew_w_root_rot = 0   # Non nel paper ma utile per stabilità
+    rew_w_ee = 40.0         # Paper Eq.10: r_ee uses -40 (Molto alto!)
+    
+    rew_alive = 0.1         # Additivo
+    
     # - reset states/conditions
     min_height_reset = 0.5  # reset if robot falls below this height [m]
