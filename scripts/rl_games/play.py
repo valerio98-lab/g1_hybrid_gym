@@ -84,6 +84,8 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import g1_hybrid_gym.tasks  # noqa: F401
 
+from g1_hybrid_gym.tasks.direct.g1_hybrid_gym.rl import rlgames_model_registry
+
 
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: dict):
