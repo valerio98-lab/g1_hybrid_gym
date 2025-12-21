@@ -9,17 +9,16 @@ class ExpertLowLevelPolicy(ModelA2CContinuousLogStd):
         super().__init__(network)
 
     def build(self, config):
-
         obs_shape = config["input_shape"]  # (127,)
         if len(obs_shape) != 1:
             raise RuntimeError(
                 f"[ExpertLowLevelPolicy] Only flat obs supported, got shape={obs_shape}"
             )
 
-        full_obs_dim = obs_shape[0]  # 4 * n_joints expected
+        full_obs_dim = obs_shape[0]  
         if (full_obs_dim) % 2 != 0:
             raise RuntimeError(
-                f"[ExpertLowLevelPolicy] Expected obs = [q, qdot, q_ref, qdot_ref] with dim 4 * n_joints, "
+                f"[ExpertLowLevelPolicy] Expected obs = [s_cur, s_ref] s_cur(69) + s_ref(69) = 138, "
                 f"but got dim={full_obs_dim}"
             )
 
@@ -78,6 +77,25 @@ class ExpertLowLevelPolicy(ModelA2CContinuousLogStd):
 
             mu, log_std, value = self.a2c_network(obs, goal)
             sigma = torch.exp(log_std)
+
+            if not hasattr(self, "_dbg_step"):
+                self._dbg_step = 0
+            self._dbg_step += 1
+
+            if self._dbg_step % 200 == 0:
+                with torch.no_grad():
+                    # batch: (num_envs, action_dim)
+                    mu0 = mu[0]
+                    sig0 = sigma[0]
+                    log0 = log_std[0]
+                    print(
+                        f"[pi_dbg] mu|mean={mu0.abs().mean().item():.3f} "
+                        f"mu|p95={mu0.abs().quantile(0.95).item():.3f} "
+                        f"sigma|mean={sig0.mean().item():.3f} "
+                        f"sigma|minmax=({sig0.min().item():.3f},{sig0.max().item():.3f})"
+                        f"log_std|mean={log0.mean().item():.3f} "
+                        f"log_std|minmax=({log0.min().item():.3f},{log0.max().item():.3f})"
+                    )
 
             distr = torch.distributions.Normal(mu, sigma, validate_args=False)
 

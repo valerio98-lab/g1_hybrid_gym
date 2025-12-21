@@ -38,17 +38,17 @@ class G1HybridGymEnvCfg(DirectRLEnvCfg):
     )
 
     # - action scale
-    action_scale = 1.0  # [N]
+    action_scale = 0.5  # [N]
     
     # - reward scales (Coefficienti per l'esponenziale: exp(-w * err))
     # Valori ispirati a DeepMimic / Paper Appendix B.2
     rew_w_pose = 2.0        # Paper Eq.10: r_q uses -2
-    rew_w_vel = 0.5         # Paper Eq.10: r_alpha uses -0.5
-    rew_w_root_pos = 10.0   # Paper Eq.10: r_root uses -10
-    rew_w_root_rot = 0   # Non nel paper ma utile per stabilità
+    rew_w_vel = 0.1         # Paper Eq.10: r_alpha uses -0.5 (Abbassato per stabilità infatti usano 0.1 nel codice)
+    rew_w_root_pos = 10.0   # Paper Eq.10: r_root uses -10. 
+    rew_w_root_rot = 0      # Non nel paper ma utile per stabilità. Al momento non usiamo rotazione del root
     rew_w_ee = 40.0         # Paper Eq.10: r_ee uses -40 (Molto alto!)
     
-    rew_alive = 0.1         # Additivo
+    rew_alive = 0.0         # Additivo. Attualmente non usato, spingeva il robot a stare in piedi ignorando il tracking
     
     # - reset states/conditions
     min_height_reset = 0.5  # reset if robot falls below this height [m]
