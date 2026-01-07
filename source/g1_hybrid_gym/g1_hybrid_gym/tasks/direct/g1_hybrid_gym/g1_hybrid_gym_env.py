@@ -36,15 +36,20 @@ class G1HybridGymEnv(DirectRLEnv):
     ):
         super().__init__(cfg, render_mode, **kwargs)
 
-        dataset_path = Path("/home/valerio/g1_hybrid_prior/data_raw/LAFAN1_Retargeting_Dataset/g1_ee_augmented")
+        dataset_path = Path(
+            "/home/valerio/g1_hybrid_prior/data_raw/LAFAN1_Retargeting_Dataset/g1_ee_augmented/walk1_subject1.csv"
+        )
         self.dataset = G1HybridPriorDataset(
             file_path=dataset_path,
             robot="g1",
             dataset_type="augmented",
-            lazy_load=False,  
+            lazy_load=False,
             vel_mode="central",
         )
-        print(f"[G1HybridGymEnv] Loaded AUGMENTED dataset with {len(self.dataset)} frames")
+        print(
+            f"[G1HybridGymEnv] Loaded AUGMENTED dataset with {len(self.dataset)} frames"
+        )
+        self._dbg_postreset_done = False
 
         dataset_joint_names = self.dataset.robot_cfg.joint_order
         isaac_joint_names = self.robot.joint_names
@@ -78,7 +83,7 @@ class G1HybridGymEnv(DirectRLEnv):
         self._build_pd_action_offset_scale()
 
         idx1 = self.dataset_to_isaac_indexes.tolist()  # list[int]
-        idx2 = self._g1_dof_idx.tolist()               # list[int]
+        idx2 = self._g1_dof_idx.tolist()  # list[int]
 
         names1 = [self.robot.joint_names[i] for i in idx1]
         names2 = [self.robot.joint_names[i] for i in idx2]
@@ -94,15 +99,22 @@ class G1HybridGymEnv(DirectRLEnv):
         # Cerchiamo gli indici dei body in Isaac che corrispondono agli EE del dataset
         self.ee_names = self.dataset.robot_cfg.ee_link_names
         self.ee_isaac_indices = []
-        
+
         all_body_names = self.robot.body_names
+
         for ee_name in self.ee_names:
             if ee_name not in all_body_names:
-                raise ValueError(f"End-Effector Link '{ee_name}' not found in Isaac articulation bodies!")
+                raise ValueError(
+                    f"End-Effector Link '{ee_name}' not found in Isaac articulation bodies!"
+                )
             self.ee_isaac_indices.append(all_body_names.index(ee_name))
-            
-        self.ee_isaac_indices = torch.tensor(self.ee_isaac_indices, device=self.device, dtype=torch.long)
-        print(f"[G1HybridGymEnv] Mapped End-Effectors: {self.ee_names} -> Indices {self.ee_isaac_indices.tolist()}")
+
+        self.ee_isaac_indices = torch.tensor(
+            self.ee_isaac_indices, device=self.device, dtype=torch.long
+        )
+        print(
+            f"[G1HybridGymEnv] Mapped End-Effectors: {self.ee_names} -> Indices {self.ee_isaac_indices.tolist()}"
+        )
 
         # Reference index per env
         self.ref_frame_idx = torch.zeros(
@@ -144,29 +156,74 @@ class G1HybridGymEnv(DirectRLEnv):
     def _build_pd_action_offset_scale(self):
         lims0 = self.robot.data.default_joint_pos_limits[0]  # (J_all, 2)
         if not torch.isfinite(lims0).all():
-            raise RuntimeError("Joint limits not finite yet. Call _build_pd_action_offset_scale later.")
+            raise RuntimeError(
+                "Joint limits not finite yet. Call _build_pd_action_offset_scale later."
+            )
 
         idx = self.dataset_to_isaac_indexes  # (J,)
-        low = lims0[idx, 0].clone()
-        high = lims0[idx, 1].clone()
+        low = lims0[idx, 0].clone().to(self.device)
+        high = lims0[idx, 1].clone().to(self.device)
 
         mid = 0.5 * (high + low)
+        half_range = 0.5 * (high - low)
 
         # LORO: curr_scale = 0.7 * (curr_high - curr_low) e poi low/high = mid +/- curr_scale
         # => span esteso = 2*curr_scale, e quindi pd_action_scale = 0.5*span_esteso = curr_scale
-        pd_scale = 0.7 * (high - low)            # (J,)
-        low_ext = mid - pd_scale                 # (J,)
-        high_ext = mid + pd_scale                # (J,)
+        # pd_scale = 0.7 * (high - low)  # (J,)
+        # low_ext = mid - pd_scale  # (J,)
+        # high_ext = mid + pd_scale  # (J,)
 
-        self._pd_action_offset = mid.to(self.device)         # (J,) (qui coincide col mid)
-        self._pd_action_scale = pd_scale.to(self.device)     # (J,)
-        self._pd_action_limit_lower = low_ext.to(self.device)
-        self._pd_action_limit_upper = high_ext.to(self.device)
+        self._joint_limit_lower = low
+        self._joint_limit_upper = high
+        self._joint_mid = mid
+        self._joint_half_range = half_range
 
-        # ---- DEBUG: top joints by pd_scale ----
-        vals, idxs = torch.topk(self._pd_action_scale.detach().abs().cpu(), k=8)
-        names = [self.robot.joint_names[int(self.dataset_to_isaac_indexes[i].item())] for i in idxs]
-        print("[pd_scale_top] ", list(zip(names, vals.tolist())))
+        # --- per-giunto action scale (alpha * half_range) ---
+        # alpha: quanto può muoversi per step in termini di frazione del range
+        # start safe: 0.10–0.20 (poi sali se serve)
+        alpha = float(getattr(self.cfg, "action_alpha", 1.0))
+        self._pd_action_scale = alpha * half_range  # (J,)
+
+        # opzionale: clamp minimo per giunti con range minuscolo (evita scale ~0)
+        self._pd_action_scale = torch.clamp(self._pd_action_scale, min=1e-4)
+
+        # # --- DEBUG: show joints with largest pd_action_scale (and their limits) ---
+        # with torch.no_grad():
+        #     k = min(12, self._pd_action_scale.numel())
+        #     vals, jj = torch.topk(
+        #         self._pd_action_scale.abs(), k=k
+        #     )  # indices in J-space (dataset order)
+
+        #     print("\n[pd_scale_debug] Top scales:")
+        #     for rank in range(k):
+        #         j = int(jj[rank].item())  # 0..J-1 (dataset joint index)
+        #         isaac_idx = int(self.dataset_to_isaac_indexes[j].item())
+        #         name = self.robot.joint_names[isaac_idx]
+
+        #         lo = float(self._joint_limit_lower[j].item())
+        #         hi = float(self._joint_limit_upper[j].item())
+        #         hr = float(self._joint_half_range[j].item())
+        #         sc = float(self._pd_action_scale[j].item())
+
+        #         print(
+        #             f"  #{rank:02d}  {name:30s}  scale={sc:8.4f}  "
+        #             f"low={lo:8.4f}  high={hi:8.4f}  half_range={hr:8.4f}  span={hi-lo:8.4f}",
+        #             flush=True,
+        #         )
+
+        #     # also print global min/max (just to confirm)
+        #     print(
+        #         f"[pd_scale_debug] scale min/max = "
+        #         f"{self._pd_action_scale.min().item():.6f} / {self._pd_action_scale.max().item():.6f}\n"
+        #     )
+
+        # # debug top scales
+        # vals, idxs = torch.topk(self._pd_action_scale.detach().abs().cpu(), k=8)
+        # names = [
+        #     self.robot.joint_names[int(self.dataset_to_isaac_indexes[i].item())]
+        #     for i in idxs
+        # ]
+        # print("[pd_scale_top] ", list(zip(names, vals.tolist())), flush=True)
 
     def _build_reference_tensors(self) -> None:
         """Pre-stack dataset frames into tensors for fast batched indexing."""
@@ -190,10 +247,12 @@ class G1HybridGymEnv(DirectRLEnv):
         self._ref_root_ang_vel = root_ang_vel.to(self.device)
         self._ref_joints = joints.to(self.device)
         self._ref_joint_vel = joint_vel.to(self.device)
-        
+
         # Stack EE pos (Se presente nel dataset)
         if "ee_pos" in frames[0]:
-            self._ref_ee_pos = torch.stack([f["ee_pos"] for f in frames], dim=0).to(self.device)
+            self._ref_ee_pos = torch.stack([f["ee_pos"] for f in frames], dim=0).to(
+                self.device
+            )
 
     def _get_ref_batch(self, frame_idx: torch.Tensor) -> dict[str, torch.Tensor]:
         """Return a batched reference dict for given per-env frame indices."""
@@ -207,47 +266,57 @@ class G1HybridGymEnv(DirectRLEnv):
             "joints": self._ref_joints.index_select(0, idx),
             "joint_vel": self._ref_joint_vel.index_select(0, idx),
         }
-        
+
         # Aggiungi EE se disponibile
         if self._ref_ee_pos is not None:
             batch["ee_pos"] = self._ref_ee_pos.index_select(0, idx)
 
-        # --- DEBUG: dataset joint_vel consistency vs finite-diff of joints ---
-        if self.common_step_counter % 500 == 0:
-            with torch.no_grad():
-                # prendi pochi env per non spammare
-                ids = torch.arange(min(8, idx.shape[0]), device=idx.device)
-                t = idx[ids]
+        # # --- DEBUG: dataset joint_vel consistency vs finite-diff of joints ---
+        # if self.common_step_counter % 500 == 0:
+        #     with torch.no_grad():
+        #         # prendi pochi env per non spammare
+        #         ids = torch.arange(min(8, idx.shape[0]), device=idx.device)
+        #         t = idx[ids]
 
-                # clamp per evitare out-of-range
-                t_prev = (t - 1).clamp(0, self.max_frame_idx)
-                t_next = (t + 1).clamp(0, self.max_frame_idx)
+        #         # clamp per evitare out-of-range
+        #         t_prev = (t - 1).clamp(0, self.max_frame_idx)
+        #         t_next = (t + 1).clamp(0, self.max_frame_idx)
 
-                q_prev = self._ref_joints.index_select(0, t_prev)   # (K,J)
-                q_next = self._ref_joints.index_select(0, t_next)   # (K,J)
-                v_stored = self._ref_joint_vel.index_select(0, t)   # (K,J)
+        #         q_prev = self._ref_joints.index_select(0, t_prev)  # (K,J)
+        #         q_next = self._ref_joints.index_select(0, t_next)  # (K,J)
+        #         v_stored = self._ref_joint_vel.index_select(0, t)  # (K,J)
 
-                # wrap per angular continuity
-                dq_central = wrap_to_pi(q_next - q_prev)            # (K,J)
+        #         # wrap per angular continuity
+        #         dq_central = wrap_to_pi(q_next - q_prev)  # (K,J)
 
-                dt_eff = float(self.cfg.sim.dt * self.cfg.decimation)  # 0.03333... nel tuo caso
-                v_fd_per_step = dq_central * 0.5                      # (K,J)  rad/step  (central diff senza /dt)
-                v_fd_per_sec  = v_fd_per_step / dt_eff                # (K,J)  rad/s
+        #         dt_eff = float(
+        #             self.cfg.sim.dt * self.cfg.decimation
+        #         )  # 0.03333... nel tuo caso
+        #         v_fd_per_step = (
+        #             dq_central * 0.5
+        #         )  # (K,J)  rad/step  (central diff senza /dt)
+        #         v_fd_per_sec = v_fd_per_step / dt_eff  # (K,J)  rad/s
 
-                # confronti di scala (ratio mediano)
-                eps = 1e-8
-                ratio_step = (v_stored.abs().mean(dim=-1) / (v_fd_per_step.abs().mean(dim=-1) + eps)).median()
-                ratio_sec  = (v_stored.abs().mean(dim=-1) / (v_fd_per_sec.abs().mean(dim=-1) + eps)).median()
+        #         # confronti di scala (ratio mediano)
+        #         eps = 1e-8
+        #         ratio_step = (
+        #             v_stored.abs().mean(dim=-1)
+        #             / (v_fd_per_step.abs().mean(dim=-1) + eps)
+        #         ).median()
+        #         ratio_sec = (
+        #             v_stored.abs().mean(dim=-1)
+        #             / (v_fd_per_sec.abs().mean(dim=-1) + eps)
+        #         ).median()
 
-                print(
-                    f"[ds_vel_check] dt_eff={dt_eff:.6f}  "
-                    f"|v_stored|mean={v_stored.abs().mean().item():.3f}  "
-                    f"|v_fd_step|mean={v_fd_per_step.abs().mean().item():.3f}  "
-                    f"|v_fd_sec|mean={v_fd_per_sec.abs().mean().item():.3f}  "
-                    f"ratio(v/v_step)~{ratio_step.item():.3f}  ratio(v/v_sec)~{ratio_sec.item():.3f}"
-                )
-        # --- END DEBUG ---  
-            
+        #         print(
+        #             f"[ds_vel_check] dt_eff={dt_eff:.6f}  "
+        #             f"|v_stored|mean={v_stored.abs().mean().item():.3f}  "
+        #             f"|v_fd_step|mean={v_fd_per_step.abs().mean().item():.3f}  "
+        #             f"|v_fd_sec|mean={v_fd_per_sec.abs().mean().item():.3f}  "
+        #             f"ratio(v/v_step)~{ratio_step.item():.3f}  ratio(v/v_sec)~{ratio_sec.item():.3f}"
+        #         )
+        # # --- END DEBUG ---
+
         return batch
 
     def _build_goal_from_ref(
@@ -274,7 +343,7 @@ class G1HybridGymEnv(DirectRLEnv):
         # --- velocities ---
         v_ref_body_ref = ref["root_lin_vel"]
         w_ref_body_ref = ref["root_ang_vel"]
-        
+
         v_ref_world = quat_rotate(q_ref, v_ref_body_ref)
         w_ref_world = quat_rotate(q_ref, w_ref_body_ref)
 
@@ -299,7 +368,7 @@ class G1HybridGymEnv(DirectRLEnv):
             self.scene.filter_collisions(global_prim_paths=[])
 
         self.scene.articulations["robot"] = self.robot
-        
+
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
@@ -313,21 +382,71 @@ class G1HybridGymEnv(DirectRLEnv):
 
         # --- TB: action stats per-env ---
         with torch.no_grad():
-            self._dbg_action_abs_mean = a.abs().mean(dim=-1)                  # (N,)
-            self._dbg_action_sat_frac = (a.abs() > 0.95).float().mean(dim=-1) # (N,)
+            self._dbg_action_abs_mean = a.abs().mean(dim=-1)  # (N,)
+            self._dbg_action_sat_frac = (a.abs() > 0.95).float().mean(dim=-1)  # (N,)
 
-        # current joint pos (serve per debug e per capire quanto "salti")
+        # current joint pos
         q0 = self.robot.data.joint_pos[:, self.dataset_to_isaac_indexes]  # (N,J)
 
-        # absolute mapping (come paper)
-        delta = self._pd_action_scale.unsqueeze(0) * a          # (N,J)
-        target = q0 + delta                                    # residual: q_hat = q + a
-        target = torch.max(target, self._pd_action_limit_lower.unsqueeze(0))
-        target = torch.min(target, self._pd_action_limit_upper.unsqueeze(0))
+        # residual mapping: target = q0 + scale * a
+        delta = self._pd_action_scale.unsqueeze(0) * a  # (N,J)
+        target = q0 + delta
+        target = torch.max(target, self._joint_limit_lower.unsqueeze(0))
+        target = torch.min(target, self._joint_limit_upper.unsqueeze(0))
 
+        # ------------------------------------------------------------
+        # NEW DEBUG: Δq stats + top joints + saturation per joint
+        # ------------------------------------------------------------
         if self.common_step_counter % 500 == 0:
             with torch.no_grad():
-                ref = self._get_ref_batch(self.ref_frame_idx.clamp(0, self.max_frame_idx))
+                abs_delta = delta.abs()  # (N,J)
+
+                mean_per_joint = abs_delta.mean(dim=0)  # (J,)
+                max_per_joint = abs_delta.max(dim=0).values  # (J,)
+
+                mean_all = abs_delta.mean().item()
+                p95_all = abs_delta.flatten().quantile(0.95).item()
+                max_all = abs_delta.max().item()
+
+                k = 8
+                top = torch.topk(mean_per_joint.cpu(), k=k)
+                top_ids = top.indices.tolist()
+                top_vals = top.values.tolist()
+                top_names = [
+                    self.robot.joint_names[int(self.dataset_to_isaac_indexes[i].item())]
+                    for i in top_ids
+                ]
+
+                topm = torch.topk(max_per_joint.cpu(), k=k)
+                topm_ids = topm.indices.tolist()
+                topm_vals = topm.values.tolist()
+                topm_names = [
+                    self.robot.joint_names[int(self.dataset_to_isaac_indexes[i].item())]
+                    for i in topm_ids
+                ]
+
+                sat_per_joint = (a.abs() > 0.95).float().mean(dim=0).cpu()  # (J,)
+                top_sat = torch.topk(sat_per_joint, k=k)
+                top_sat_ids = top_sat.indices.tolist()
+                top_sat_vals = top_sat.values.tolist()
+                top_sat_names = [
+                    self.robot.joint_names[int(self.dataset_to_isaac_indexes[i].item())]
+                    for i in top_sat_ids
+                ]
+
+                print(
+                    f"[dq_stats] mean={mean_all:.4f}  p95={p95_all:.4f}  max={max_all:.4f}"
+                )
+                print("[dq_top_mean] ", list(zip(top_names, top_vals)))
+                print("[dq_top_max]  ", list(zip(topm_names, topm_vals)))
+                print("[a_sat_top]   ", list(zip(top_sat_names, top_sat_vals)))
+
+        # keep your existing debug (tgt_dbg etc.) if you want
+        if self.common_step_counter % 500 == 0:
+            with torch.no_grad():
+                ref = self._get_ref_batch(
+                    self.ref_frame_idx.clamp(0, self.max_frame_idx)
+                )
                 ref_q = ref["joints"]  # (N,J)
 
                 dq_tgt = (target - q0).abs().mean().item()
@@ -335,53 +454,50 @@ class G1HybridGymEnv(DirectRLEnv):
                 err_tgt = (target - ref_q).abs().mean().item()
 
                 jv = self.robot.data.joint_vel[:, self.dataset_to_isaac_indexes]
-                print(f"[tgt_dbg] |tgt-q0|mean={dq_tgt:.3f}  |q0-ref|mean={err_now:.3f}  |tgt-ref|mean={err_tgt:.3f}  |jv|mean={jv.abs().mean().item():.3f}")
-                
-                dq = (target - q0).abs().mean(dim=0)          # (J,)
-                jv = self.robot.data.joint_vel[:, self.dataset_to_isaac_indexes].abs().mean(dim=0)
-
-                top = torch.topk(dq.cpu(), k=6)
-                names = [self.robot.joint_names[int(self.dataset_to_isaac_indexes[i].item())] for i in top.indices]
-                print("[dq_top] ", list(zip(names, top.values.tolist())))
-
-                topv = torch.topk(jv.cpu(), k=6)
-                namesv = [self.robot.joint_names[int(self.dataset_to_isaac_indexes[i].item())] for i in topv.indices]
-                print("[jv_top] ", list(zip(namesv, topv.values.tolist())))
+                print(
+                    f"[tgt_dbg] |tgt-q0|mean={dq_tgt:.3f}  |q0-ref|mean={err_now:.3f}  "
+                    f"|tgt-ref|mean={err_tgt:.3f}  |jv|mean={jv.abs().mean().item():.3f}"
+                )
 
         self._target_q = target
 
         # --- DEBUG ACTIONS (every N steps) ---
-        if self.common_step_counter % 200 == 0:
-            a_pre_clamp = a_no_clamp
-            a_print = a
-            sa = self._pd_action_scale.unsqueeze(0) * a
-            sat = (a_print.abs() > 0.95).float().mean().item()
-            sat_pre = (a_pre_clamp.abs() > 0.95).float().mean().item()
-            mean_abs = a_print.abs().mean().item()
-            mean_abs_pre = a_pre_clamp.abs().mean().item()
-            sa_mean_abs = sa.abs().mean().item()
-            k = max(1, int(0.95 * a_print.numel()))
-            k_pre = max(1, int(0.95 * a_pre_clamp.numel()))
-            p95 = a_print.abs().flatten().kthvalue(k).values.item()
-            p95_pre = a_pre_clamp.abs().flatten().kthvalue(k_pre).values.item()
-            print(f"[actions post clamp] mean|a|={mean_abs:.3f}  sat%={sat*100:.1f}%  approx_p95|a|={p95:.3f}")
-            print(f"[actions pre clamp] mean|a|={mean_abs_pre:.3f} sat%={sat_pre*100:.1f}%  approx_p95|a|={p95_pre:.3f}")
-            print(f"[scaled_actions] mean|a|={mean_abs:.3f} sat%={sat*100:.1f}%  mean|scaled|={sa_mean_abs:.3f}")
-            print("pd_scale min/max:", self._pd_action_scale.min().item(), self._pd_action_scale.max().item())
-            print("low/high ext min/max:", self._pd_action_limit_lower.min().item(), self._pd_action_limit_upper.max().item())
-        # --- DEBUG ACTIONS (every N steps) ---
+        if self.common_step_counter % 500 == 0:
+            with torch.no_grad():
+                sat = (a.abs() > 0.95).float().mean().item()
+                mean_abs = a.abs().mean().item()
+                sa = self._pd_action_scale.unsqueeze(0) * a
+                sa_mean_abs = sa.abs().mean().item()
+
+                k = max(1, int(0.95 * a.numel()))
+                p95 = a.abs().flatten().kthvalue(k).values.item()
+
+                print(
+                    f"[actions post clamp] mean|a|={mean_abs:.3f}  sat%={sat*100:.1f}%  approx_p95|a|={p95:.3f}"
+                )
+                print(f"[scaled_actions] mean|scaled|={sa_mean_abs:.3f}")
+                print(
+                    "pd_scale min/max:",
+                    self._pd_action_scale.min().item(),
+                    self._pd_action_scale.max().item(),
+                )
+                print(
+                    "joint limits min/max:",
+                    self._joint_limit_lower.min().item(),
+                    self._joint_limit_upper.max().item(),
+                )
+        # --- DEBUG ACTIONS ---
 
     def _apply_action(self):
         if getattr(self, "_target_q", None) is None:
             return
         self.robot.set_joint_position_target(self._target_q, joint_ids=self._g1_dof_idx)
 
-
     def step(self, action):
         """
         This step function extends the step function of DirectRLEnv by adding
         logging of various debug statistics when an episode ends. In a nutshell,
-        It's a wrapper around the parent step() that just adds logging on done episodes, 
+        It's a wrapper around the parent step() that just adds logging on done episodes,
         basically is useless from a functionality/physics/simulation point of view.
         """
         obs, rew, terminated, truncated, extras = super().step(action)
@@ -417,8 +533,8 @@ class G1HybridGymEnv(DirectRLEnv):
 
         if self._dbg_maxdist is not None:
             log["ee_maxdist_mean"] = float(_mean(self._dbg_maxdist).item())
-            log["ee_maxdist_p95"]  = float(_p95(self._dbg_maxdist).item())
-            log["ee_maxdist_max"]  = float(_max(self._dbg_maxdist).item())
+            log["ee_maxdist_p95"] = float(_p95(self._dbg_maxdist).item())
+            log["ee_maxdist_max"] = float(_max(self._dbg_maxdist).item())
 
         # ---- MSE terms ----
         if self._dbg_joint_pos_mse is not None:
@@ -456,7 +572,14 @@ class G1HybridGymEnv(DirectRLEnv):
         joint_vel = self.robot.data.joint_vel[:, self.dataset_to_isaac_indexes]
 
         s_cur = torch.cat(
-            (h, root_quat_wxyz, root_lin_vel_body, root_ang_vel_body, joint_pos, joint_vel),
+            (
+                h,
+                root_quat_wxyz,
+                root_lin_vel_body,
+                root_ang_vel_body,
+                joint_pos,
+                joint_vel,
+            ),
             dim=-1,
         )
 
@@ -479,7 +602,9 @@ class G1HybridGymEnv(DirectRLEnv):
     def _get_dones(self):
         time_out = self.episode_length_buf >= self.max_episode_length - 1
 
-        root_z_rel = self.robot.data.root_link_state_w[:, 2] - self.scene.env_origins[:, 2]
+        root_z_rel = (
+            self.robot.data.root_link_state_w[:, 2] - self.scene.env_origins[:, 2]
+        )
         fallen = root_z_rel < self.cfg.min_height_reset
         terminated = fallen
 
@@ -493,7 +618,9 @@ class G1HybridGymEnv(DirectRLEnv):
         if ref.get("ee_pos") is not None:
             ee_state_w = self.robot.data.body_state_w[:, self.ee_isaac_indices, 0:3]
             ee_pos_rel = ee_state_w - self.scene.env_origins.unsqueeze(1)
-            max_dist = torch.linalg.norm(ee_pos_rel - ref["ee_pos"], dim=-1).max(dim=-1).values
+            max_dist = (
+                torch.linalg.norm(ee_pos_rel - ref["ee_pos"], dim=-1).max(dim=-1).values
+            )
 
             ee_term = max_dist > 0.5
             terminated = terminated | ee_term
@@ -507,17 +634,18 @@ class G1HybridGymEnv(DirectRLEnv):
                     fallen_pct = fallen.float().mean().item() * 100
                     ee_pct = ee_term.float().mean().item() * 100
                     md_mean = max_dist.mean().item()
-                    md_p95  = max_dist.quantile(0.95).item()
-                    md_max  = max_dist.max().item()
-                    print(f"[done_dbg] fallen%={fallen_pct:.1f} ee_term%={ee_pct:.1f} "
-                          f"maxdist mean={md_mean:.3f} p95={md_p95:.3f} max={md_max:.3f}")
+                    md_p95 = max_dist.quantile(0.95).item()
+                    md_max = max_dist.max().item()
+                    print(
+                        f"[done_dbg] fallen%={fallen_pct:.1f} ee_term%={ee_pct:.1f} "
+                        f"maxdist mean={md_mean:.3f} p95={md_p95:.3f} max={md_max:.3f}"
+                    )
         else:
             # --- TB buffers ---
             self._dbg_maxdist = None
             self._dbg_ee_term = None
 
         return terminated, time_out
-
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
         if env_ids is None:
@@ -542,7 +670,7 @@ class G1HybridGymEnv(DirectRLEnv):
             joint_vel_0 = self._ref_joint_vel[random_starts]
         else:
             # Fallback lazy load
-            frame0 = self.dataset[0] 
+            frame0 = self.dataset[0]
             root_pos_0 = frame0["root_pos"].to(self.device).repeat(n, 1)
             # (logica lazy completa omessa per brevità dato che usi pre-stack)
 
@@ -565,36 +693,47 @@ class G1HybridGymEnv(DirectRLEnv):
 
         default_joint_pos = self.robot.data.default_joint_pos[env_ids].clone()
         default_joint_vel = self.robot.data.default_joint_vel[env_ids].clone()
-        
+
         default_joint_pos[:, self.dataset_to_isaac_indexes] = joints_0
         default_joint_vel[:, self.dataset_to_isaac_indexes] = joint_vel_0
 
         self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
-        self.robot.write_joint_state_to_sim(default_joint_pos, default_joint_vel, None, env_ids)
+        self.robot.write_joint_state_to_sim(
+            default_joint_pos, default_joint_vel, None, env_ids
+        )
 
-        # # --- DEBUG: check EE alignment right after reset ---
-        # # (run only once, and only if env 0 was among the reset ids)
-        # if (env_ids == 0).any() and not getattr(self, "_dbg_ee_checked", False):
-        #     self._dbg_ee_checked = True
+        # --- DEBUG: EE alignment right after reset (run once) ---
+        # if (not self._dbg_postreset_done) and ((env_ids == 0).any()):
+        #     self._dbg_postreset_done = True
 
-        #     # refresh kinematics without advancing dynamics
+        #     # 1) forza sync state -> sim, poi aggiorna kinematics senza avanzare tempo
         #     self.scene.write_data_to_sim()
         #     self.sim.forward()
         #     self.scene.update(dt=0.0)
 
-        #     # evaluate ONLY on the envs that were just reset (env_ids)
-        #     ids = env_ids
+        #     ids = torch.tensor([0], device=self.device, dtype=torch.long)
 
-        #     # ref for those ids
-        #     ref = self._get_ref_batch(self.ref_frame_idx[ids].clamp(0, self.max_frame_idx))
+        #     # 2) ref EE (relative to env origin)
+        #     ref = self._get_ref_batch(
+        #         self.ref_frame_idx[ids].clamp(0, self.max_frame_idx)
+        #     )
+        #     assert ref.get("ee_pos") is not None, "No ee_pos in dataset!"
 
-        #     if ref.get("ee_pos") is not None:
-        #         ee_state_w = self.robot.data.body_state_w[ids][:, self.ee_isaac_indices, 0:3]
-        #         ee_pos_rel = ee_state_w - self.scene.env_origins[ids].unsqueeze(1)
+        #     # 3) sim EE (relative to env origin)
+        #     ee_state_w = self.robot.data.body_state_w[ids][
+        #         :, self.ee_isaac_indices, 0:3
+        #     ]  # (1,4,3)
+        #     ee_pos_rel = ee_state_w - self.scene.env_origins[ids].unsqueeze(1)
 
-        #         max_dist = torch.linalg.norm(ee_pos_rel - ref["ee_pos"], dim=-1).max(dim=-1).values
-        #         print(f"[DEBUG reset] ee max_dist (reset envs only): mean={max_dist.mean().item():.3f}  max={max_dist.max().item():.3f}")
+        #     # 4) distances
+        #     dist = torch.linalg.norm(ee_pos_rel - ref["ee_pos"], dim=-1)  # (1,4)
+        #     print("[POST-RESET EE CHECK]")
+        #     for k, name in enumerate(self.ee_names):
+        #         print(f"  {name}: dist = {dist[0,k].item():.4f} m")
+        #     print(
+        #         f"  max = {dist.max().item():.4f} m, mean = {dist.mean().item():.4f} m"
+        #     )
 
         self._cached_ref_tensors = None
 
@@ -602,10 +741,10 @@ class G1HybridGymEnv(DirectRLEnv):
         # Dati Robot Correnti
         joint_pos = self.robot.data.joint_pos[:, self.dataset_to_isaac_indexes]
         joint_vel = self.robot.data.joint_vel[:, self.dataset_to_isaac_indexes]
-        
+
         # Root state relativo all'origine dell'env
         root_link_state = self.robot.data.root_link_state_w
-        root_pos_w = root_link_state[:, 0:3] - self.scene.env_origins 
+        root_pos_w = root_link_state[:, 0:3] - self.scene.env_origins
         root_quat_w = quat_normalize(root_link_state[:, 3:7])
 
         # End-Effector State Corrente (Robot)
@@ -626,37 +765,47 @@ class G1HybridGymEnv(DirectRLEnv):
 
         # --- TB: error terms per-env (MSE) ---
         with torch.no_grad():
-            self._dbg_joint_pos_mse = ((joint_pos - ref["joints"]) ** 2).mean(dim=-1)         # (N,)
-            self._dbg_joint_vel_mse = ((joint_vel - ref["joint_vel"]) ** 2).mean(dim=-1)      # (N,)
-            self._dbg_root_pos_mse  = ((root_pos_w - ref["root_pos"]) ** 2).sum(dim=-1)       # (N,)
+            self._dbg_joint_pos_mse = ((joint_pos - ref["joints"]) ** 2).mean(
+                dim=-1
+            )  # (N,)
+            self._dbg_joint_vel_mse = ((joint_vel - ref["joint_vel"]) ** 2).mean(
+                dim=-1
+            )  # (N,)
+            self._dbg_root_pos_mse = ((root_pos_w - ref["root_pos"]) ** 2).sum(
+                dim=-1
+            )  # (N,)
 
             if ref.get("ee_pos") is not None:
-                self._dbg_ee_pos_mse = ((ee_pos_rel - ref["ee_pos"]) ** 2).sum(dim=-1).mean(dim=-1)  # (N,)
+                self._dbg_ee_pos_mse = (
+                    ((ee_pos_rel - ref["ee_pos"]) ** 2).sum(dim=-1).mean(dim=-1)
+                )  # (N,)
             else:
                 self._dbg_ee_pos_mse = None
 
         # --- DEBUG REWARD TERMS (every N steps) ---
         if self.common_step_counter % 200 == 0:
             with torch.no_grad():
-                joint_pos_err = torch.mean((joint_pos - ref["joints"])**2, dim=-1)
-                joint_vel_err = torch.mean((joint_vel - ref["joint_vel"])**2, dim=-1)
+                joint_pos_err = torch.mean((joint_pos - ref["joints"]) ** 2, dim=-1)
+                joint_vel_err = torch.mean((joint_vel - ref["joint_vel"]) ** 2, dim=-1)
 
-                root_pos_err = torch.sum((root_pos_w - ref["root_pos"])**2, dim=-1)
+                root_pos_err = torch.sum((root_pos_w - ref["root_pos"]) ** 2, dim=-1)
 
-                #quat_dot = torch.sum(root_quat_w * ref["root_quat_wxyz"], dim=-1).abs().clamp(0.0, 1.0)
-                #root_rot_err = 1.0 - quat_dot
+                # quat_dot = torch.sum(root_quat_w * ref["root_quat_wxyz"], dim=-1).abs().clamp(0.0, 1.0)
+                # root_rot_err = 1.0 - quat_dot
 
                 if ref.get("ee_pos") is not None:
-                    ee_sq_err = torch.sum((ee_pos_rel - ref["ee_pos"])**2, dim=-1)   # (N,4)
-                    ee_total_err = torch.mean(ee_sq_err, dim=-1)                     # (N,)
+                    ee_sq_err = torch.sum(
+                        (ee_pos_rel - ref["ee_pos"]) ** 2, dim=-1
+                    )  # (N,4)
+                    ee_total_err = torch.mean(ee_sq_err, dim=-1)  # (N,)
                 else:
                     ee_total_err = torch.zeros_like(root_pos_err)
 
-                r_pose   = torch.exp(-self.cfg.rew_w_pose * joint_pos_err)
-                r_vel    = torch.exp(-self.cfg.rew_w_vel * joint_vel_err)
+                r_pose = torch.exp(-self.cfg.rew_w_pose * joint_pos_err)
+                r_vel = torch.exp(-self.cfg.rew_w_vel * joint_vel_err)
                 r_root_p = torch.exp(-self.cfg.rew_w_root_pos * root_pos_err)
-                #r_root_r = torch.exp(-self.cfg.rew_w_root_rot * root_rot_err)
-                r_ee     = torch.exp(-self.cfg.rew_w_ee * ee_total_err)
+                # r_root_r = torch.exp(-self.cfg.rew_w_root_rot * root_rot_err)
+                r_ee = torch.exp(-self.cfg.rew_w_ee * ee_total_err)
 
                 print(
                     f"[rew_terms] "
@@ -667,27 +816,28 @@ class G1HybridGymEnv(DirectRLEnv):
                     f"| ee_err={ee_total_err.mean().item():.2e} root_err={root_pos_err.mean().item():.2e}"
                 )
 
-                # --- DEBUG joint vel (ogni 500 step, solo env 0) ---
-        if (self.common_step_counter % 500 == 0):
-            e = 0  # env index
-            jv = joint_vel[e]                 # (29,)
-            rjv = ref["joint_vel"][e]         # (29,)
-            diff = jv - rjv
-            w = self.cfg.rew_w_vel
-            mse_sum = diff.pow(2).sum()
-            mse_mean = diff.pow(2).mean()
-            print(f"[jvel_dbg] exp(-w*sum)={torch.exp(-w*mse_sum).item():.3e}  exp(-w*mean)={torch.exp(-w*mse_mean).item():.3e}")
+        #         # --- DEBUG joint vel (ogni 500 step, solo env 0) ---
+        # if self.common_step_counter % 500 == 0:
+        #     e = 0  # env index
+        #     jv = joint_vel[e]  # (29,)
+        #     rjv = ref["joint_vel"][e]  # (29,)
+        #     diff = jv - rjv
+        #     w = self.cfg.rew_w_vel
+        #     mse_sum = diff.pow(2).sum()
+        #     mse_mean = diff.pow(2).mean()
+        #     print(
+        #         f"[jvel_dbg] exp(-w*sum)={torch.exp(-w*mse_sum).item():.3e}  exp(-w*mean)={torch.exp(-w*mse_mean).item():.3e}"
+        #     )
 
-            print(
-                "[jvel_dbg] "
-                f"|jv|mean={jv.abs().mean().item():.3f}  "
-                f"|ref|mean={rjv.abs().mean().item():.3f}  "
-                f"diff|mean={diff.abs().mean().item():.3f}  "
-                f"diff|p95={diff.abs().quantile(0.95).item():.3f}  "
-                f"MSE_mean={(diff.pow(2).mean()).item():.3e}  "
-                f"MSE_sum={(diff.pow(2).sum()).item():.3e}"
-            )
-
+        #     print(
+        #         "[jvel_dbg] "
+        #         f"|jv|mean={jv.abs().mean().item():.3f}  "
+        #         f"|ref|mean={rjv.abs().mean().item():.3f}  "
+        #         f"diff|mean={diff.abs().mean().item():.3f}  "
+        #         f"diff|p95={diff.abs().quantile(0.95).item():.3f}  "
+        #         f"MSE_mean={(diff.pow(2).mean()).item():.3e}  "
+        #         f"MSE_sum={(diff.pow(2).sum()).item():.3e}"
+        #     )
 
         total_reward = compute_rewards(
             self.cfg.rew_w_pose,
@@ -697,9 +847,17 @@ class G1HybridGymEnv(DirectRLEnv):
             self.cfg.rew_w_ee,
             self.cfg.rew_alive,
             # Current Robot State
-            joint_pos, joint_vel, root_pos_w, root_quat_w, ee_pos_rel,
+            joint_pos,
+            joint_vel,
+            root_pos_w,
+            root_quat_w,
+            ee_pos_rel,
             # Reference State
-            ref["joints"], ref["joint_vel"], ref["root_pos"], ref["root_quat_wxyz"], ref.get("ee_pos"),
+            ref["joints"],
+            ref["joint_vel"],
+            ref["root_pos"],
+            ref["root_quat_wxyz"],
+            ref.get("ee_pos"),
             # Flags
             self.reset_terminated,
         )
@@ -736,7 +894,7 @@ def compute_rewards(
     # Flags
     reset_terminated: torch.Tensor,
 ) -> torch.Tensor:
-    
+
     # DeepMimic Style Rewards
     joint_pos_err = torch.mean(torch.square(joint_pos - ref_joint_pos), dim=-1)
     # Velocity joints
@@ -744,8 +902,8 @@ def compute_rewards(
     # Root position
     root_pos_err = torch.sum(torch.square(root_pos - ref_root_pos), dim=-1)
     # Root rotation (1 - |dot|)
-    #quat_dot = torch.sum(root_quat * ref_root_quat, dim=-1).abs().clamp(0.0, 1.0)
-    #root_rot_err = 1.0 - quat_dot #(Errore su rotazione, non necessario al momento)
+    # quat_dot = torch.sum(root_quat * ref_root_quat, dim=-1).abs().clamp(0.0, 1.0)
+    # root_rot_err = 1.0 - quat_dot #(Errore su rotazione, non necessario al momento)
 
     # End-Effector Error
     if ref_ee_pos is not None:
@@ -757,19 +915,18 @@ def compute_rewards(
         ee_total_err = torch.zeros_like(root_pos_err)
 
     # Kernel Esponenziali (Moltiplicativi) sempre DeepMimic Style
-    
+
     r_pose = torch.exp(-rew_w_pose * joint_pos_err)
     r_vel = torch.exp(-rew_w_vel * joint_vel_err)
     r_root_p = torch.exp(-rew_w_root_pos * root_pos_err)
-    #r_root_r = torch.exp(-rew_w_root_rot * root_rot_err)
+    # r_root_r = torch.exp(-rew_w_root_rot * root_rot_err)
     r_ee = torch.exp(-rew_w_ee * ee_total_err)
-
 
     # 3. Reward Totale
     # Struttura moltiplicativa per l'imitazione: forza il rispetto di tutti i vincoli
     imitation_reward = r_pose * r_vel * r_root_p * r_ee
-    
+
     # Bonus sopravvivenza additivo (per gradienti stabili all'inizio)
-    alive_bonus = rew_alive * (1.0 - reset_terminated.float())
+    # alive_bonus = rew_alive * (1.0 - reset_terminated.float())
 
     return imitation_reward

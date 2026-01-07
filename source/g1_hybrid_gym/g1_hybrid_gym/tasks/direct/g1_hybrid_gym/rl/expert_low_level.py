@@ -1,5 +1,4 @@
 import torch
-import yaml
 from rl_games.algos_torch.models import ModelA2CContinuousLogStd
 from g1_hybrid_prior.expert_policy import LowLevelExpertPolicy
 
@@ -15,7 +14,7 @@ class ExpertLowLevelPolicy(ModelA2CContinuousLogStd):
                 f"[ExpertLowLevelPolicy] Only flat obs supported, got shape={obs_shape}"
             )
 
-        full_obs_dim = obs_shape[0]  
+        full_obs_dim = obs_shape[0]
         if (full_obs_dim) % 2 != 0:
             raise RuntimeError(
                 f"[ExpertLowLevelPolicy] Expected obs = [s_cur, s_ref] s_cur(69) + s_ref(69) = 138, "
@@ -114,7 +113,7 @@ class ExpertLowLevelPolicy(ModelA2CContinuousLogStd):
                     "sigmas": sigma,
                 }
             else:
-                action = distr.sample()
+                action = mu  # distr.sample()
                 neglogp = self.neglogp(action, mu, sigma, log_std)
                 return {
                     "neglogpacs": torch.squeeze(neglogp),
