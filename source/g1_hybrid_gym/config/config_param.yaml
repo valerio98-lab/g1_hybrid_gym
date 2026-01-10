@@ -1,0 +1,8 @@
+dataset_params: 
+  training_type: "ppo_amp" # "ppo_amp" or "ppo"
+  dataset_path: "/home/valerio/g1_hybrid_prior/data_amp/LAFAN-G1/LAFAN_walk1_subject1_0_-1.npz"
+  robot: "g1"
+  dataset_type: "augmented" # "raw" or "augmented"
+  lazy_load: False
+  vel_mode: "central" # "central" or "backward"
+

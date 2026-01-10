@@ -1,4 +1,4 @@
 from rl_games.algos_torch import model_builder
-from .expert_low_level import ExpertLowLevelPolicy
+from .wrapper_ppo import ExpertLowLevelPolicy
 
-model_builder.register_model("expert_low_level", ExpertLowLevelPolicy)
+model_builder.register_model("wrapper_ppo", ExpertLowLevelPolicy)

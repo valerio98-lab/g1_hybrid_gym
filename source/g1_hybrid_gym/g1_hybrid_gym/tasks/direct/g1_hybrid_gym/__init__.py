@@ -14,7 +14,7 @@ from . import agents
 
 gym.register(
     id="Template-G1-Hybrid-Gym-Direct-v0",
-    entry_point=f"{__name__}.g1_hybrid_gym_env:G1HybridGymEnv",
+    entry_point=f"{__name__}.g1_hybrid_gym_env_ppo:G1HybridGymEnvPPO",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.g1_hybrid_gym_env_cfg:G1HybridGymEnvCfg",
