@@ -10,7 +10,7 @@ from skrl.models.torch import GaussianMixin, DeterministicMixin, Model
 # =============================================================================
 class PolicyWrapperAMP(GaussianMixin, Model):
     def __init__(
-        self, observation_space, action_space, device, expert_net, clip_actions=False
+        self, observation_space, action_space, device, actor_net, clip_actions=False
     ):
         Model.__init__(self, observation_space, action_space, device)
         GaussianMixin.__init__(
@@ -20,14 +20,15 @@ class PolicyWrapperAMP(GaussianMixin, Model):
             min_log_std=-20,
             max_log_std=2,
         )
-        self.net = expert_net
+        self.actor = actor_net
 
     def compute(self, inputs, role=""):
         x = inputs["states"]
         half_dim = x.shape[-1] // 2
         obs = x[..., :half_dim]
         target = x[..., half_dim:]
-        mu, log_std, _ = self.net(obs, target)
+
+        mu, log_std = self.actor(obs, target)
         return mu, log_std, {}
 
 
@@ -35,17 +36,18 @@ class PolicyWrapperAMP(GaussianMixin, Model):
 # WRAPPER VALUE (CRITIC) - Nessuna modifica qui
 # =============================================================================
 class PolicyValueWrapper(DeterministicMixin, Model):
-    def __init__(self, observation_space, action_space, device, expert_net):
+    def __init__(self, observation_space, action_space, device, critic_net):
         Model.__init__(self, observation_space, action_space, device)
         DeterministicMixin.__init__(self, clip_actions=False)
-        self.net = expert_net
+        self.critic = critic_net
 
     def compute(self, inputs, role=""):
         x = inputs["states"]
         half_dim = x.shape[-1] // 2
         obs = x[..., :half_dim]
         target = x[..., half_dim:]
-        _, _, value = self.net(obs, target)
+
+        value = self.critic(obs, target)
         return value, {}
 
 
@@ -59,9 +61,10 @@ class AMPDiscriminator(DeterministicMixin, Model):
 
         # Calcoliamo la dimensione attesa (69)
         if input_dim is None:
-            self.input_dim = observation_space.shape[0] // 2
-        else:
-            self.input_dim = input_dim
+            raise ValueError("AMPDiscriminator deve ricevere esplicitamente input_dim!")
+
+        self.input_dim = input_dim
+        print(f"[AMPDiscriminator] Initialized with Input Dim: {self.input_dim}")
 
         self.net = nn.Sequential(
             nn.Linear(self.input_dim, 1024),
@@ -80,14 +83,19 @@ class AMPDiscriminator(DeterministicMixin, Model):
         if x.shape[-1] == self.input_dim:
             return self.net(x), {}
 
-        # Altrimenti, se è doppio (138), taglialo.
-        # Questo potrebbe succedere se SKRL passasse l'obs intera per sbaglio.
-        elif x.shape[-1] == self.input_dim * 2:
-            amp_obs = x[..., : self.input_dim]
-            return self.net(amp_obs), {}
+        # Safety check opzionale
+        if x.shape[-1] != self.input_dim:
+            # Caso limite: se per qualche motivo arrivasse qualcosa di strano
+            # proviamo a tagliare solo se è ESATTAMENTE il doppio ma stampiamo warning
+            if x.shape[-1] == self.input_dim * 2:
+                print(
+                    f"[AMPDiscriminator] ⚠️ Warning: Input dimension {x.shape[-1]} is double the expected {self.input_dim}. Truncating input."
+                )
+                return self.net(x[..., : self.input_dim]), {}
 
-        # Fallback di sicurezza (o errore se dimensioni strane)
-        else:
-            # Proviamo a tagliare a metà come default, ma stampiamo un warning se serve debug
-            half = x.shape[-1] // 2
-            return self.net(x[..., :half]), {}
+            # Altrimenti crasha per avvisarci del mismatch
+            raise RuntimeError(
+                f"Discriminator expected {self.input_dim}, got {x.shape[-1]}"
+            )
+
+        return self.net(x), {}

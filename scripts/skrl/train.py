@@ -47,7 +47,7 @@ from g1_hybrid_gym.tasks.direct.g1_hybrid_gym.g1_hybrid_gym_env_amp import (
 from g1_hybrid_gym.tasks.direct.g1_hybrid_gym.g1_hybrid_gym_env_cfg import (
     G1HybridGymEnvCfg,
 )
-from g1_hybrid_prior.expert_policy import LowLevelExpertPolicy
+from g1_hybrid_prior.expert_policy import LowLevelActor, LowLevelCritic
 
 
 def main():
@@ -72,18 +72,39 @@ def main():
 
     print(f"[Train] Obs: {full_obs_dim} | State: {state_dim} | Action: {action_dim}")
 
-    expert_net = LowLevelExpertPolicy(
+    actor_net = LowLevelActor(
         obs_dim=state_dim, goal_dim=state_dim, action_dim=action_dim, device=device
     )
+    critic_net = LowLevelCritic(obs_dim=state_dim, goal_dim=state_dim, device=device)
 
     policy = PolicyWrapperAMP(
-        env.observation_space, env.action_space, device, expert_net
+        env.observation_space, env.action_space, device, actor_net
     )
     value = PolicyValueWrapper(
-        env.observation_space, env.action_space, device, expert_net
+        env.observation_space, env.action_space, device, critic_net
     )
+
+    def unwrap_to_custom(env):
+        curr = env
+        while hasattr(curr, "env"):
+            curr = curr.env
+        return curr  # dovrebbe essere G1HybridGymEnvAMP
+
+    custom_env = unwrap_to_custom(env)
+
+    print("AMP obs dim (env):", custom_env.amp_observation_space.shape[0])
+    print("Demo sample dim:", custom_env.fetch_amp_expert_batch(8).shape)
+
+    amp_dim = custom_env.amp_observation_space.shape[0]
+    print(f"[Train] AMP Obs Dim (Discriminator Input): {amp_dim}")
+    if amp_dim != state_dim * 2:
+        print(
+            f"⚠️ WARNING: AMP Dim ({amp_dim}) != 2 * State Dim ({state_dim*2}). "
+            "Assicurati che num_amp_obs_steps=2 in config_param.yaml se vuoi seguire il paper."
+        )
+
     discriminator = AMPDiscriminator(
-        env.observation_space, env.action_space, device, input_dim=state_dim
+        env.observation_space, env.action_space, device, input_dim=amp_dim
     )
 
     models = {"policy": policy, "value": value, "discriminator": discriminator}
@@ -95,11 +116,11 @@ def main():
     cfg_amp["learning_rate_scheduler"] = KLAdaptiveRL
     cfg_amp["learning_rate_scheduler_kwargs"] = {"kl_threshold": 0.008}
 
-    cfg_amp["rollouts"] = 32
-    cfg_amp["learning_epochs"] = 5
-    cfg_amp["mini_batches"] = 8
+    cfg_amp["rollouts"] = 16
+    cfg_amp["learning_epochs"] = 6
+    cfg_amp["mini_batches"] = 1
 
-    cfg_amp["discount_factor"] = 0.99
+    cfg_amp["discount_factor"] = 0.95
     cfg_amp["lambda"] = 0.95
 
     cfg_amp["ratio_clip"] = 0.1
@@ -108,15 +129,17 @@ def main():
     cfg_amp["entropy_loss_scale"] = 0.0
     cfg_amp["grad_norm_clip"] = 1.0
 
-    cfg_amp["amp_batch_size"] = 4096
+    cfg_amp["amp_batch_size"] = 1024
 
     cfg_amp["task_reward_weight"] = 0.5
     cfg_amp["style_reward_weight"] = 0.5
 
-    cfg_amp["discriminator_batch_size"] = 4096
+    cfg_amp["discriminator_loss_scale"] = 5.0
+    cfg_amp["discriminator_batch_size"] = 8192
     cfg_amp["discriminator_reward_scale"] = 2
-    cfg_amp["discriminator_gradient_penalty_scale"] = 10.0
+    cfg_amp["discriminator_gradient_penalty_scale"] = 5
     cfg_amp["discriminator_logit_regularization_scale"] = 0.05
+    cfg_amp["discriminator_weight_decay_scale"] = 1e-4
 
     run_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + "_G1_AMP"
     cfg_amp["experiment"]["directory"] = os.path.join("logs", "skrl", run_name)
@@ -124,41 +147,15 @@ def main():
     cfg_amp["experiment"]["checkpoint_interval"] = 2000
 
     # ------------------------------------------------------------------------
-    # 1. RECUPERO DATI ESPERTO (PRIMA DELL'AGENTE)
-    # ------------------------------------------------------------------------
-    try:
-        if hasattr(env, "unwrapped"):
-            target_env = env.unwrapped
-            if hasattr(target_env, "dataset"):
-                expert_data = target_env.dataset.amp_batch
-            elif hasattr(target_env, "env") and hasattr(target_env.env, "dataset"):
-                expert_data = target_env.env.dataset.amp_batch
-            else:
-                # Ricerca profonda
-                curr = env
-                while hasattr(curr, "env"):
-                    curr = curr.env
-                    if hasattr(curr, "dataset"):
-                        expert_data = curr.dataset.amp_batch
-                        break
-        else:
-            expert_data = env.dataset.amp_batch
-
-        print(f"[Train] Found expert data tensor: {expert_data.shape}")
-
-    except AttributeError as e:
-        print(f"❌ ERRORE: Impossibile trovare il dataset AMP. Dettagli: {e}")
-        sys.exit(1)
-
-    # ------------------------------------------------------------------------
     # 2. DEFINIZIONE FUNZIONE LOADER (Cruciale per questa versione di SKRL)
     # ------------------------------------------------------------------------
     # Questa funzione viene chiamata dall'agente dentro __init__ e durante il training
     # per pescare batch casuali dal tensore statico.
     def amp_motion_loader(n_samples: int):
-        # Campiona indici casuali
-        idx = torch.randint(0, expert_data.shape[0], (n_samples,), device=device)
-        return expert_data[idx]
+        return custom_env.fetch_amp_expert_batch(n_samples)
+
+    demo = amp_motion_loader(8)
+    print("[Train] Demo sample dim:", demo.shape, flush=True)  # deve essere (8, K*69)
 
     # ------------------------------------------------------------------------
     # 3. PREPARAZIONE MEMORIE
@@ -177,7 +174,7 @@ def main():
 
     # C. Reply Buffer (Dati Discriminatore) - Serve a stabilizzare il GAN
     reply_buffer = RandomMemory(
-        memory_size=200000, num_envs=1, device=device, replacement=False
+        memory_size=1000000, num_envs=1, device=device, replacement=False
     )
 
     # ------------------------------------------------------------------------
@@ -195,15 +192,21 @@ def main():
         action_space=env.action_space,
         device=device,
         # Argomenti specifici AMP
-        amp_observation_space=state_dim,  # Dimensione dello stato AMP (69)
+        amp_observation_space=custom_env.amp_observation_space,  # Dimensione dello stato AMP (69)
         motion_dataset=motion_dataset,  # Memoria vuota (verrà riempita dal loader)
         reply_buffer=reply_buffer,  # Memoria vuota per replay
-        collect_reference_motions=amp_motion_loader,  # <--- LA FUNZIONE CHE RISOLVE TUTTO
+        collect_reference_motions=amp_motion_loader,
     )
 
     # --- TRAINING ---
-    print("🚀 Starting Training...")
-    trainer = SequentialTrainer(cfg=cfg_amp, env=env, agents=agent)
+    print("Starting Training...")
+    trainer_cfg = {
+        "timesteps": 500_000,
+        "headless": True,
+        "disable_progressbar": False,
+        "close_environment_at_exit": True,
+    }
+    trainer = SequentialTrainer(cfg=trainer_cfg, env=env, agents=agent)
     trainer.train()
 
     simulation_app.close()

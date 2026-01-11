@@ -5,4 +5,4 @@ dataset_params:
   dataset_type: "augmented" # "raw" or "augmented"
   lazy_load: False
   vel_mode: "central" # "central" or "backward"
-
+  num_amp_obs_steps : 2

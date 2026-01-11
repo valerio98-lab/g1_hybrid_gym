@@ -34,7 +34,7 @@ class G1HybridGymEnvCfg(DirectRLEnvCfg):
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=8192, env_spacing=4.0, replicate_physics=True
+        num_envs=4096, env_spacing=4.0, replicate_physics=True
     )
 
     # - action scale
@@ -43,7 +43,7 @@ class G1HybridGymEnvCfg(DirectRLEnvCfg):
     # - reward scales (Coefficienti per l'esponenziale: exp(-w * err))
     # Valori ispirati a DeepMimic / Paper Appendix B.2
     rew_w_pose = 2.0  # Paper Eq.10: r_q uses -2
-    rew_w_vel = 0.1  # Paper Eq.10: r_alpha uses -0.5 (Abbassato per stabilità infatti usano 0.1 nel codice)
+    rew_w_vel = 0.5  # Paper Eq.10: r_alpha uses -0.5 (Abbassato per stabilità infatti usano 0.1 nel codice)
     rew_w_root_pos = 10.0  # Paper Eq.10: r_root uses -10.
     rew_w_root_rot = 0  # Non nel paper ma utile per stabilità. Al momento non usiamo rotazione del root
     rew_w_ee = 40.0  # Paper Eq.10: r_ee uses -40 (Molto alto!)

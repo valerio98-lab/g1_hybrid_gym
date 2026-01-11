@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import torch
-from typing import Tuple
+import numpy as np
+from typing import Tuple, Sequence
+import gymnasium as gym
 
 from .g1_hybrid_gym_env_base import G1HybridGymEnvBase
 from g1_hybrid_prior.dataset_builder import make_dataset
@@ -20,12 +22,53 @@ class G1HybridGymEnvAMP(G1HybridGymEnvBase):
     def _load_dataset(self):
         cfg_params = self._read_dataset_params()
         cfg_params["training_type"] = "ppo_amp"
+        self._num_amp_obs_steps = cfg_params.get("num_amp_obs_steps")
         return make_dataset(cfg=cfg_params, device=self.device)
 
     def __init__(self, *args, **kwargs):
         # Chiamiamo il genitore. Questo scatenerà _build_reference_tensors.
         # Grazie al fix "lazy init" sotto, non crasherà più.
         super().__init__(*args, **kwargs)
+        J = int(self.dataset.dof_pos.shape[1])  # oppure self.dataset.dof_pos.shape[1]
+        self._amp_obs_per_step = 11 + 2 * J  # deve venire 69 se J=29
+
+        assert self._num_amp_obs_steps >= 2
+
+        self._amp_obs_buf = torch.zeros(
+            (self.num_envs, self._num_amp_obs_steps, self._amp_obs_per_step),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        print(
+            f"[G1HybridGymEnvAMP] Loading AMP dataset with {self._num_amp_obs_steps} obs steps...",
+            flush=True,
+        )
+        print(
+            f"[G1HybridGymEnvAMP] AMP shape self._num_amp_obs_steps * self._amp_obs_per_step: {self._num_amp_obs_steps} * {self._amp_obs_per_step} = {self._num_amp_obs_steps * self._amp_obs_per_step}",
+            flush=True,
+        )
+        self.amp_observation_space = gym.spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(self._num_amp_obs_steps * self._amp_obs_per_step,),
+            dtype=np.float32,
+        )
+        print("[AMP DEBUG] num_envs:", self.num_envs, flush=True)
+        print(
+            "[AMP DEBUG] K:",
+            self._num_amp_obs_steps,
+            "per_step:",
+            self._amp_obs_per_step,
+            flush=True,
+        )
+        print(
+            "[AMP DEBUG] amp_observation_space.shape:",
+            self.amp_observation_space.shape,
+            flush=True,
+        )
+
+        self._curr_amp_obs_buf = self._amp_obs_buf[:, 0]
+        self._hist_amp_obs_buf = self._amp_obs_buf[:, 1:]
 
     def _setup_body_mapping(self):
         """Calcola il mapping tra i body di Isaac e quelli del Dataset NPZ."""
@@ -125,18 +168,78 @@ class G1HybridGymEnvAMP(G1HybridGymEnvBase):
         # Reorder/select bodies to match tracked Isaac bodies
         self._ref_body_pos = body_pos_w.index_select(1, self._body_npz_indices)
 
+    def _compute_amp_obs_step(self, obs_dict: dict) -> torch.Tensor:
+        # obs_dict["policy"] = [s_cur, goal]
+        full_obs = obs_dict["policy"]
+        half_len = full_obs.shape[-1] // 2
+        return full_obs[..., :half_len]  # s_cur
+
+    def step(self, action):
+        obs, rew, terminated, truncated, extras = super().step(action)
+        if extras is None:
+            extras = {}
+        extras["amp_obs"] = self._amp_obs_buf.reshape(self.num_envs, -1)
+        return obs, rew, terminated, truncated, extras
+
     def _get_observations(self) -> dict:
         obs_dict = super()._get_observations()
 
-        # amp_obs = s_cur = prima metà di (s_cur || goal)
-        full_obs = obs_dict["policy"]
-        half_len = full_obs.shape[-1] // 2
-        s_cur = full_obs[..., :half_len]
+        curr = self._compute_amp_obs_step(obs_dict)
 
-        if self.extras is None:
-            self.extras = {}
-        self.extras["amp_obs"] = s_cur
+        self._amp_obs_buf[:, 1:] = self._amp_obs_buf[:, :-1].clone()
+        self._amp_obs_buf[:, 0] = curr
+
         return obs_dict
+
+    def _build_s_cur(self, env_ids: torch.Tensor) -> torch.Tensor:
+        # root state
+        root_link_state = self.robot.data.root_link_state_w[env_ids]  # (n, 13)
+        root_pos_w = root_link_state[:, 0:3]
+        root_quat_wxyz = quat_normalize(root_link_state[:, 3:7])
+
+        v_link_world = root_link_state[:, 7:10]
+        w_link_world = root_link_state[:, 10:13]
+
+        root_lin_vel_body = quat_rotate_inv(root_quat_wxyz, v_link_world)
+        root_ang_vel_body = quat_rotate_inv(root_quat_wxyz, w_link_world)
+
+        env_origins = self.scene.env_origins[env_ids]
+        h = (root_pos_w - env_origins)[:, 2:3]
+
+        joint_pos = self.robot.data.joint_pos[env_ids][:, self.dataset_to_isaac_indexes]
+        joint_vel = self.robot.data.joint_vel[env_ids][:, self.dataset_to_isaac_indexes]
+
+        s_cur = torch.cat(
+            (
+                h,
+                root_quat_wxyz,
+                root_lin_vel_body,
+                root_ang_vel_body,
+                joint_pos,
+                joint_vel,
+            ),
+            dim=-1,
+        )
+        return s_cur  # (n, 69)
+
+    def _reset_idx(self, env_ids: Sequence[int] | None):
+        # 1) fai tutto il reset standard (quello che hai nel base)
+        super()._reset_idx(env_ids)
+
+        # 2) normalizza env_ids come fa il base (per essere robusti)
+        if env_ids is None:
+            env_ids = self.robot._ALL_INDICES
+        env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
+
+        if hasattr(self.robot, "update"):
+            self.robot.update(dt=self.cfg.sim.dt)
+
+        s_cur = self._build_s_cur(env_ids)  # (n, 69)
+
+        # Fill history with same frame (NVIDIA init)
+        self._amp_obs_buf[env_ids] = s_cur.unsqueeze(1).repeat(
+            1, self._num_amp_obs_steps, 1
+        )
 
     def _get_dones(self):
         terminated, time_out = super()._get_dones()
