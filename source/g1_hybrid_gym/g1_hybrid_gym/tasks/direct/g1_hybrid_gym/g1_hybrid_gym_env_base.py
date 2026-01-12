@@ -412,6 +412,7 @@ class G1HybridGymEnvBase(DirectRLEnv):
         )
 
         obs = torch.cat((s_cur, goal), dim=-1)
+
         return {"policy": obs}
 
     # --------------------------------------------------------------------- #

@@ -1,6 +1,5 @@
 # g1_hybrid_gym/skrl_utils.py
 
-import torch
 import torch.nn as nn
 from skrl.models.torch import GaussianMixin, DeterministicMixin, Model
 
@@ -77,7 +76,6 @@ class AMPDiscriminator(DeterministicMixin, Model):
     def compute(self, inputs, role=""):
         x = inputs["states"]
 
-        # --- FIX INTELLIGENTE ---
         # Se l'input ha già la dimensione giusta (69), usalo così com'è.
         # Questo succede durante il training update (dati presi dalla memoria AMP).
         if x.shape[-1] == self.input_dim:

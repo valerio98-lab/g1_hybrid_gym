@@ -53,19 +53,6 @@ class G1HybridGymEnvAMP(G1HybridGymEnvBase):
             shape=(self._num_amp_obs_steps * self._amp_obs_per_step,),
             dtype=np.float32,
         )
-        print("[AMP DEBUG] num_envs:", self.num_envs, flush=True)
-        print(
-            "[AMP DEBUG] K:",
-            self._num_amp_obs_steps,
-            "per_step:",
-            self._amp_obs_per_step,
-            flush=True,
-        )
-        print(
-            "[AMP DEBUG] amp_observation_space.shape:",
-            self.amp_observation_space.shape,
-            flush=True,
-        )
 
         self._curr_amp_obs_buf = self._amp_obs_buf[:, 0]
         self._hist_amp_obs_buf = self._amp_obs_buf[:, 1:]
@@ -88,13 +75,33 @@ class G1HybridGymEnvAMP(G1HybridGymEnvBase):
         isaac_body_names = self.robot.body_names
 
         name_to_npz = {n: i for i, n in enumerate(npz_body_names)}
+        # ------------- EE mapping (NPZ indices) -------------
+        # self.ee_names viene dal Base: dataset.robot_cfg.ee_link_names
+        ee_npz_indices = []
+        if getattr(self, "ee_names", None):
+            for ee_name in self.ee_names:
+                if ee_name not in name_to_npz:
+                    raise ValueError(
+                        f"[G1HybridGymEnvAMP] EE link '{ee_name}' not found in NPZ body names!"
+                    )
+                ee_npz_indices.append(name_to_npz[ee_name])
+
+        self._ee_npz_indices = torch.as_tensor(
+            ee_npz_indices, device=self.device, dtype=torch.long
+        )
+        ee_npz = [npz_body_names[j] for j in self._ee_npz_indices.tolist()]
+        if ee_npz != self.ee_names:
+            print("[AMP] EE names (env):", self.ee_names)
+            print("[AMP] EE names (npz):", ee_npz)
+            raise ValueError("[AMP] EE mapping mismatch")
+
         body_isaac_indices = []
         body_npz_indices = []
 
         # Tracciamo SOLO i body che esistono in entrambi (di solito saranno tutti)
-        for isaac_name in isaac_body_names:
+        for i, isaac_name in enumerate(isaac_body_names):
             if isaac_name in name_to_npz:
-                body_isaac_indices.append(isaac_body_names.index(isaac_name))
+                body_isaac_indices.append(i)
                 body_npz_indices.append(name_to_npz[isaac_name])
 
         if len(body_isaac_indices) == 0:
@@ -102,12 +109,25 @@ class G1HybridGymEnvAMP(G1HybridGymEnvBase):
                 "[G1HybridGymEnvAMP] No overlapping body names between NPZ and Isaac."
             )
 
-        self._body_isaac_indices = torch.tensor(
+        self._body_isaac_indices = torch.as_tensor(
             body_isaac_indices, device=self.device, dtype=torch.long
         )
-        self._body_npz_indices = torch.tensor(
+        self._body_npz_indices = torch.as_tensor(
             body_npz_indices, device=self.device, dtype=torch.long
         )
+
+        tracked_isaac = [isaac_body_names[i] for i in self._body_isaac_indices.tolist()]
+        tracked_npz = [npz_body_names[j] for j in self._body_npz_indices.tolist()]
+
+        # devono corrispondere esattamente nello stesso ordine
+        if tracked_isaac != tracked_npz:
+            # trova il primo mismatch e stampalo bene
+            for k, (a, b) in enumerate(zip(tracked_isaac, tracked_npz)):
+                if a != b:
+                    raise ValueError(
+                        f"[AMP] Body mapping mismatch at k={k}: isaac='{a}' npz='{b}'"
+                    )
+            raise ValueError("[AMP] Body mapping mismatch (length/order)")
 
         # ------------- Contact bodies (da escludere nel maxdist) -------------
         # Tipicamente piedi
@@ -151,9 +171,6 @@ class G1HybridGymEnvAMP(G1HybridGymEnvBase):
         self._ref_joints = self.dataset.dof_pos
         self._ref_joint_vel = self.dataset.dof_vel
 
-        # AMP: EE non serve
-        self._ref_ee_pos = None
-
         # Bodies positions per early termination (WORLD, relative to env origin == ok)
         # dataset deve esporre body_pos_w: (T, B, 3)
         body_pos_w = getattr(self.dataset, "body_pos_w", None)
@@ -164,6 +181,14 @@ class G1HybridGymEnvAMP(G1HybridGymEnvBase):
             raise ValueError(
                 "[G1HybridGymEnvAMP] Dataset must expose body_pos_w tensor (T,B,3)."
             )
+
+        # EE positions for reward (same as PPO pipeline, paper-faithful)
+        # body_pos_w: (T, B, 3) in NPZ body order
+        # we select only the EE links in the same order as self.ee_names
+        if self.ee_isaac_indices is not None and self._ee_npz_indices.numel() > 0:
+            self._ref_ee_pos = body_pos_w.index_select(1, self._ee_npz_indices)
+        else:
+            self._ref_ee_pos = None
 
         # Reorder/select bodies to match tracked Isaac bodies
         self._ref_body_pos = body_pos_w.index_select(1, self._body_npz_indices)
