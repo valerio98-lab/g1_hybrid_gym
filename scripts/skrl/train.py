@@ -234,7 +234,7 @@ def main():
     cfg_amp["experiment"]["write_interval"] = 100
     cfg_amp["experiment"]["checkpoint_interval"] = 2000
 
-    env = AMPLoggingWrapper(env, discriminator, cfg_amp, device)
+    # env = AMPLoggingWrapper(env, discriminator, cfg_amp, device)
 
     # ------------------------------------------------------------------------
     # 2. DEFINIZIONE FUNZIONE LOADER (Cruciale per questa versione di SKRL)

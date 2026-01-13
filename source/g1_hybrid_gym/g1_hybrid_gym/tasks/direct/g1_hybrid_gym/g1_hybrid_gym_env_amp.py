@@ -221,7 +221,6 @@ class G1HybridGymEnvAMP(G1HybridGymEnvBase):
 
     def step(self, action):
         obs, rew, terminated, truncated, extras = super().step(action)
-
         if extras is None:
             extras = {}
         extras["amp_obs"] = self._amp_obs_buf.reshape(self.num_envs, -1)
@@ -310,11 +309,11 @@ class G1HybridGymEnvAMP(G1HybridGymEnvBase):
         progress_buf = self.episode_length_buf.to(torch.float32)
 
         if self.max_rot_reset:
-            curr_body_rot_wxyz = self.robot.data.body_state_w[
-                :, self._body_isaac_indices, 3:7
-            ]
-            # goal rotations (N,K,4) wxyz
-            goal_body_rot_wxyz = ref["body_rot"]
+            curr_body_rot_wxyz = quat_normalize(
+                self.robot.data.body_state_w[:, self._body_isaac_indices, 3:7]
+            )
+            goal_body_rot_wxyz = quat_normalize(ref["body_rot"])
+
             upper_body_ids = self._upper_body_ids
 
             reset_f, term_f = compute_imitation_reset_max_posrot_upper(
@@ -415,13 +414,8 @@ def compute_imitation_reset_max_posrot_upper(
         # -------------------------
         # ROT: max angle error on upper body only
         # -------------------------
-        eps = 1e-8
-        curr_q = curr_rigid_body_rot / (
-            curr_rigid_body_rot.norm(dim=-1, keepdim=True) + eps
-        )
-        goal_q = goal_rigid_body_rot / (
-            goal_rigid_body_rot.norm(dim=-1, keepdim=True) + eps
-        )
+        curr_q = curr_rigid_body_rot
+        goal_q = goal_rigid_body_rot
 
         # angular distance: angle = 2*acos(|dot|)
         dot = torch.sum(curr_q * goal_q, dim=-1).abs().clamp(0.0, 1.0)  # (N,K)

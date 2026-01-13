@@ -6,3 +6,22 @@ dataset_params:
   lazy_load: False
   vel_mode: "central" # "central" or "backward"
   num_amp_obs_steps : 2
+  max_rot_reset: True
+  upper_names:
+    - "left_shoulder_pitch_link"
+    - "left_shoulder_roll_link"
+    - "left_shoulder_yaw_link"
+    - "left_elbow_link"
+    - "left_wrist_roll_link"
+    - "left_wrist_pitch_link"
+    - "left_wrist_yaw_link"
+    - "right_shoulder_pitch_link"
+    - "right_shoulder_roll_link"
+    - "right_shoulder_yaw_link"
+    - "right_elbow_link"
+    - "right_wrist_roll_link"
+    - "right_wrist_pitch_link"
+    - "right_wrist_yaw_link"
+
+
+#/home/valerio/g1_hybrid_prior/data_raw/LAFAN1_Retargeting_Dataset/g1_ee_augmented/walk1_subject1.csv

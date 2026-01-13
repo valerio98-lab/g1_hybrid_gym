@@ -92,25 +92,4 @@ class AMPDiscriminator(DeterministicMixin, Model):
                 f"(non tronco: voglio vedere il bug)"
             )
 
-        # 2) Debug euristico ogni tanto: le due metà dovrebbero essere “simili” se è davvero [s_t, s_tm1]
-        #    Se invece è [s_cur, goal], la 2a metà (goal) ha statistiche spesso molto diverse.
-        self._dbg_counter += 1
-        if self._dbg_counter % 200 == 0 and self.K == 2:
-            s0 = x[..., : self.per_step_dim]
-            s1 = x[..., self.per_step_dim : 2 * self.per_step_dim]
-            m0, s0std = s0.mean().item(), s0.std().item()
-            m1, s1std = s1.mean().item(), s1.std().item()
-            print(
-                f"[AMPDiscriminator][chk] block0 mean/std={m0:.4f}/{s0std:.4f} | block1 mean/std={m1:.4f}/{s1std:.4f}",
-                flush=True,
-            )
-
-            # se std differisce troppo spesso è policy-goal spacciato per amp_obs
-            ratio = s1std / (s0std + 1e-8)
-            if ratio > 3.0 or ratio < 0.33:
-                raise RuntimeError(
-                    "[AMPDiscriminator] Suspicious input: second block stats very different. "
-                    "Probabile che stai passando policy obs (s_cur+goal) invece di amp_obs (s_t+s_tm1)."
-                )
-
         return self.net(x), {}

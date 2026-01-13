@@ -366,10 +366,9 @@ class G1HybridGymEnvBase(DirectRLEnv):
 
         # ---- action stats (arrivate all'env) ----
         if self._dbg_action_abs_mean is not None:
-            log["action_abs_mean"] = _mean(self._dbg_action_abs_mean)
+            log["action_abs_mean"] = _mean(self._dbg_action_abs_mean).item()
         if self._dbg_action_sat_frac is not None:
             log["action_sat_pct"] = _mean(self._dbg_action_sat_frac) * 100.0
-
         return obs, rew, terminated, truncated, extras
 
     def _get_observations(self) -> dict:
@@ -556,6 +555,7 @@ class G1HybridGymEnvBase(DirectRLEnv):
         self.ref_frame_idx[self.ref_frame_idx > self.max_frame_idx] = 0
 
         self._cached_ref_tensors = None
+
         return total_reward
 
 
