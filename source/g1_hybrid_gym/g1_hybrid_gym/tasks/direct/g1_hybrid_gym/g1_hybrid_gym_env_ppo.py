@@ -32,5 +32,7 @@ class G1HybridGymEnvPPO(G1HybridGymEnvBase):
             )
             ee_term = max_dist > 0.5
             terminated = terminated | ee_term
+            self._dbg_ee_term = ee_term
+            self._dbg_maxdist = max_dist
 
         return terminated, time_out

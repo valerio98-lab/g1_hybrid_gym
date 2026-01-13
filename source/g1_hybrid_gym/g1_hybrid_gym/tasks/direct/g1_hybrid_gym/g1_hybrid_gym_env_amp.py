@@ -22,13 +22,15 @@ class G1HybridGymEnvAMP(G1HybridGymEnvBase):
     def _load_dataset(self):
         cfg_params = self._read_dataset_params()
         cfg_params["training_type"] = "ppo_amp"
-        self._num_amp_obs_steps = cfg_params.get("num_amp_obs_steps")
+        self.cfg_params = cfg_params
         return make_dataset(cfg=cfg_params, device=self.device)
 
     def __init__(self, *args, **kwargs):
         # Chiamiamo il genitore. Questo scatenerà _build_reference_tensors.
         # Grazie al fix "lazy init" sotto, non crasherà più.
         super().__init__(*args, **kwargs)
+        self._num_amp_obs_steps = self.cfg_params.get("num_amp_obs_steps")
+        self.max_rot_reset = bool(self.cfg_params.get("max_rot_reset", True))
         J = int(self.dataset.dof_pos.shape[1])  # oppure self.dataset.dof_pos.shape[1]
         self._amp_obs_per_step = 11 + 2 * J  # deve venire 69 se J=29
 
@@ -115,10 +117,12 @@ class G1HybridGymEnvAMP(G1HybridGymEnvBase):
         self._body_npz_indices = torch.as_tensor(
             body_npz_indices, device=self.device, dtype=torch.long
         )
-
+        # print("Isaac Names:", [isaac_body_names[i] for i in body_isaac_indices])
+        # print("NPZ Names:", [npz_body_names[i] for i in body_npz_indices])
         tracked_isaac = [isaac_body_names[i] for i in self._body_isaac_indices.tolist()]
         tracked_npz = [npz_body_names[j] for j in self._body_npz_indices.tolist()]
-
+        # print("[AMP] Tracked Isaac Bodies:", tracked_isaac)
+        # print("[AMP] Tracked NPZ Bodies:", tracked_npz)
         # devono corrispondere esattamente nello stesso ordine
         if tracked_isaac != tracked_npz:
             # trova il primo mismatch e stampalo bene
@@ -146,6 +150,11 @@ class G1HybridGymEnvAMP(G1HybridGymEnvBase):
         print(
             f"[G1HybridGymEnvAMP] Tracking bodies K={len(body_isaac_indices)} | "
             f"contact_ids(local)={contact_body_ids_local}"
+        )
+        upper_names = self.cfg_params.get("upper_names")
+        upper_ids_local = [name_to_local[n] for n in upper_names if n in name_to_local]
+        self._upper_body_ids = torch.tensor(
+            upper_ids_local, device=self.device, dtype=torch.long
         )
 
     def _build_reference_tensors(self):
@@ -182,6 +191,17 @@ class G1HybridGymEnvAMP(G1HybridGymEnvBase):
                 "[G1HybridGymEnvAMP] Dataset must expose body_pos_w tensor (T,B,3)."
             )
 
+        body_rot_w = getattr(self.dataset, "body_rot_w", None)
+        if body_rot_w is None:
+            body_rot_w = getattr(self.dataset, "body_rotations_w", None)
+        if body_rot_w is None:
+            # se nel dataset hai solo raw, aggiungilo in G1AMPDataset come tensor self.body_rot_w
+            raise ValueError("Dataset must expose body_rot_w (T,B,4).")
+
+        self._ref_body_rot = body_rot_w.index_select(
+            1, self._body_npz_indices
+        )  # (T,K,4)
+
         # EE positions for reward (same as PPO pipeline, paper-faithful)
         # body_pos_w: (T, B, 3) in NPZ body order
         # we select only the EE links in the same order as self.ee_names
@@ -201,9 +221,11 @@ class G1HybridGymEnvAMP(G1HybridGymEnvBase):
 
     def step(self, action):
         obs, rew, terminated, truncated, extras = super().step(action)
+
         if extras is None:
             extras = {}
         extras["amp_obs"] = self._amp_obs_buf.reshape(self.num_envs, -1)
+
         return obs, rew, terminated, truncated, extras
 
     def _get_observations(self) -> dict:
@@ -211,7 +233,7 @@ class G1HybridGymEnvAMP(G1HybridGymEnvBase):
 
         curr = self._compute_amp_obs_step(obs_dict)
 
-        self._amp_obs_buf[:, 1:] = self._amp_obs_buf[:, :-1].clone()
+        self._amp_obs_buf = torch.roll(self._amp_obs_buf, shifts=1, dims=1)
         self._amp_obs_buf[:, 0] = curr
 
         return obs_dict
@@ -287,15 +309,38 @@ class G1HybridGymEnvAMP(G1HybridGymEnvBase):
         reset_buf = self.reset_buf.to(torch.float32)
         progress_buf = self.episode_length_buf.to(torch.float32)
 
-        reset_f, term_f = compute_imitation_reset_max(
-            reset_buf=reset_buf,
-            progress_buf=progress_buf,
-            curr_rigid_body_pos=curr_body_pos_rel,
-            goal_rigid_body_pos=goal_body_pos,
-            contact_body_ids=self._contact_body_ids,
-            max_episode_length=float(self.max_episode_length),
-            enable_early_termination=True,
-        )
+        if self.max_rot_reset:
+            curr_body_rot_wxyz = self.robot.data.body_state_w[
+                :, self._body_isaac_indices, 3:7
+            ]
+            # goal rotations (N,K,4) wxyz
+            goal_body_rot_wxyz = ref["body_rot"]
+            upper_body_ids = self._upper_body_ids
+
+            reset_f, term_f = compute_imitation_reset_max_posrot_upper(
+                reset_buf=reset_buf,
+                progress_buf=progress_buf,
+                curr_rigid_body_pos=curr_body_pos_rel,
+                goal_rigid_body_pos=goal_body_pos,
+                curr_rigid_body_rot=curr_body_rot_wxyz,
+                goal_rigid_body_rot=goal_body_rot_wxyz,
+                contact_body_ids=self._contact_body_ids,
+                upper_body_ids=upper_body_ids,
+                max_episode_length=float(self.max_episode_length),
+                enable_early_termination=True,
+                pos_threshold=0.3,
+                rot_threshold_deg=90.0,
+            )
+        else:
+            reset_f, term_f = compute_imitation_reset_max(
+                reset_buf=reset_buf,
+                progress_buf=progress_buf,
+                curr_rigid_body_pos=curr_body_pos_rel,
+                goal_rigid_body_pos=goal_body_pos,
+                contact_body_ids=self._contact_body_ids,
+                max_episode_length=float(self.max_episode_length),
+                enable_early_termination=True,
+            )
 
         term_amp = term_f > 0.5
         terminated = terminated | term_amp
@@ -322,12 +367,80 @@ def compute_imitation_reset_max(
         pos_dist = (
             (curr_rigid_body_pos - goal_rigid_body_pos).pow(2).sum(dim=-1).sqrt()
         )  # (N,K)
-
+        # print("pos_dist shape:", pos_dist.shape)
+        # print("pos_dist:", pos_dist)
         if contact_body_ids.numel() > 0:
             pos_dist[:, contact_body_ids] = 0.0
 
         max_pos_dist = torch.max(pos_dist, dim=-1).values
         has_deviated = max_pos_dist > 0.5
+        # print("has_deviated:", has_deviated)
+        terminated = torch.where(has_deviated, torch.ones_like(reset_buf), terminated)
+
+    reset = torch.where(
+        progress_buf >= max_episode_length - 1.0, torch.ones_like(reset_buf), terminated
+    )
+    return reset, terminated
+
+
+@torch.jit.script
+def compute_imitation_reset_max_posrot_upper(
+    reset_buf: torch.Tensor,  # (N,)
+    progress_buf: torch.Tensor,  # (N,)
+    curr_rigid_body_pos: torch.Tensor,  # (N,K,3)  (rel to env origin)
+    goal_rigid_body_pos: torch.Tensor,  # (N,K,3)
+    curr_rigid_body_rot: torch.Tensor,  # (N,K,4)  (wxyz, normalized or close)
+    goal_rigid_body_rot: torch.Tensor,  # (N,K,4)  (wxyz, normalized or close)
+    contact_body_ids: torch.Tensor,  # (C,) local indices in K, can be empty
+    upper_body_ids: torch.Tensor,  # (U,) local indices in K, non-empty recommended
+    max_episode_length: float,
+    enable_early_termination: bool,
+    pos_threshold: float,  # e.g. 0.2
+    rot_threshold_deg: float,  # e.g. 90.0
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    terminated = torch.zeros_like(reset_buf)
+
+    if enable_early_termination:
+        # -------------------------
+        # POS: reset-max (paper style)
+        # -------------------------
+        pos_dist = (
+            (curr_rigid_body_pos - goal_rigid_body_pos).pow(2).sum(dim=-1).sqrt()
+        )  # (N,K)
+        if contact_body_ids.numel() > 0:
+            pos_dist[:, contact_body_ids] = 0.0
+        max_pos_dist = torch.max(pos_dist, dim=-1).values  # (N,)
+        has_pos_deviated = max_pos_dist > pos_threshold
+
+        # -------------------------
+        # ROT: max angle error on upper body only
+        # -------------------------
+        eps = 1e-8
+        curr_q = curr_rigid_body_rot / (
+            curr_rigid_body_rot.norm(dim=-1, keepdim=True) + eps
+        )
+        goal_q = goal_rigid_body_rot / (
+            goal_rigid_body_rot.norm(dim=-1, keepdim=True) + eps
+        )
+
+        # angular distance: angle = 2*acos(|dot|)
+        dot = torch.sum(curr_q * goal_q, dim=-1).abs().clamp(0.0, 1.0)  # (N,K)
+        ang = 2.0 * torch.acos(dot)  # rad, (N,K)
+        rad2deg = 57.29577951308232  # 180/pi
+        ang_deg = ang * rad2deg
+
+        # focus on upper body only
+        if upper_body_ids.numel() > 0:
+            ang_deg_upper = ang_deg.index_select(1, upper_body_ids)  # (N,U)
+            max_ang_deg = torch.max(ang_deg_upper, dim=-1).values  # (N,)
+        else:
+            # fallback: if empty, consider all (not recommended)
+            max_ang_deg = torch.max(ang_deg, dim=-1).values
+
+        has_rot_deviated = max_ang_deg > rot_threshold_deg
+
+        # combine
+        has_deviated = has_pos_deviated | has_rot_deviated
         terminated = torch.where(has_deviated, torch.ones_like(reset_buf), terminated)
 
     reset = torch.where(

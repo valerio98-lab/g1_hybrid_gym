@@ -48,6 +48,94 @@ from g1_hybrid_gym.tasks.direct.g1_hybrid_gym.g1_hybrid_gym_env_cfg import (
     G1HybridGymEnvCfg,
 )
 from g1_hybrid_prior.expert_policy import LowLevelActor, LowLevelCritic
+import gymnasium as gym
+import torch
+
+
+class AMPLoggingWrapper(gym.Wrapper):
+    def __init__(self, env, discriminator, cfg_amp: dict, device: str):
+        super().__init__(env)
+        self.discriminator = discriminator
+        self.device = torch.device(device)
+        self.device_type = self.device.type
+
+        self.w_task = float(cfg_amp.get("task_reward_weight", 0.5))
+        self.w_style = float(cfg_amp.get("style_reward_weight", 0.5))
+        self.disc_reward_scale = float(cfg_amp.get("discriminator_reward_scale", 2.0))
+
+        # episode accumulators (per-env)
+        n = self.env.num_envs
+        self._ep_task = torch.zeros(n, device=self.device)
+        self._ep_style = torch.zeros(n, device=self.device)
+        self._ep_combined = torch.zeros(n, device=self.device)
+
+    @property
+    def num_envs(self):
+        return self.env.num_envs
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        # safe reset accumulators
+        self._ep_task.zero_()
+        self._ep_style.zero_()
+        self._ep_combined.zero_()
+        return obs, info
+
+    @torch.no_grad()
+    def step(self, action):
+        obs, rew, terminated, truncated, infos = self.env.step(action)
+
+        # infos può essere dict o list; skrl/isaaclab wrapper di solito usa dict
+        if infos is None:
+            infos = {}
+        if isinstance(infos, list):
+            # fallback raro: converti a dict vuoto
+            infos = {}
+
+        amp_obs = infos.get("amp_obs", None)  # (N, amp_dim)
+        if amp_obs is None:
+            # se manca, non possiamo loggare style/combined
+            return obs, rew, terminated, truncated, infos
+        amp_obs = amp_obs.to(self.device)
+        # --- style reward identica a skrl.agents.torch.amp ---
+        with torch.autocast(device_type=self.device_type, enabled=False):
+            logits, _, _ = self.discriminator.act(
+                {"states": amp_obs}, role="discriminator"
+            )
+            # prob = 1 / (1 + exp(-logits))
+            prob = 1.0 / (1.0 + torch.exp(-logits))
+            # style = -log(max(1 - prob, 1e-4))
+            style = -torch.log(
+                torch.maximum(1.0 - prob, torch.tensor(1e-4, device=self.device))
+            )
+            style = style.view_as(rew) * self.disc_reward_scale  # (N,)
+
+        combined = self.w_task * rew + self.w_style * style  # (N,)
+
+        # accumula per episodio
+        self._ep_task += rew
+        self._ep_style += style
+        self._ep_combined += combined
+
+        done = terminated | truncated
+        if done.any():
+            done_ids = done.nonzero(as_tuple=False).squeeze(-1)
+
+            log = infos.setdefault("log", {})
+            log["Reward / task_ep_mean"] = float(self._ep_task[done_ids].mean().item())
+            log["Reward / style_ep_mean"] = float(
+                self._ep_style[done_ids].mean().item()
+            )
+            log["Reward / combined_ep_mean"] = float(
+                self._ep_combined[done_ids].mean().item()
+            )
+
+            # reset accumulators per gli env che hanno finito episodio
+            self._ep_task[done_ids] = 0.0
+            self._ep_style[done_ids] = 0.0
+            self._ep_combined[done_ids] = 0.0
+
+        return obs, rew, terminated, truncated, infos
 
 
 def main():
@@ -145,6 +233,8 @@ def main():
     cfg_amp["experiment"]["directory"] = os.path.join("logs", "skrl", run_name)
     cfg_amp["experiment"]["write_interval"] = 100
     cfg_amp["experiment"]["checkpoint_interval"] = 2000
+
+    env = AMPLoggingWrapper(env, discriminator, cfg_amp, device)
 
     # ------------------------------------------------------------------------
     # 2. DEFINIZIONE FUNZIONE LOADER (Cruciale per questa versione di SKRL)

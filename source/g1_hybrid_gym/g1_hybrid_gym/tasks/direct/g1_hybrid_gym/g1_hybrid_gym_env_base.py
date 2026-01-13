@@ -135,6 +135,7 @@ class G1HybridGymEnvBase(DirectRLEnv):
         self._ref_joint_vel: torch.Tensor | None = None
         self._ref_ee_pos: torch.Tensor | None = None  # optional (PPO)
         self._ref_body_pos: torch.Tensor | None = None  # optional (AMP early term)
+        self._ref_body_rot: torch.Tensor | None = None
 
         self._build_reference_tensors()
 
@@ -206,6 +207,9 @@ class G1HybridGymEnvBase(DirectRLEnv):
             batch["ee_pos"] = self._ref_ee_pos.index_select(0, idx)
         if self._ref_body_pos is not None:
             batch["body_pos"] = self._ref_body_pos.index_select(0, idx)
+        if self._ref_body_rot is not None:
+            batch["body_rot"] = self._ref_body_rot.index_select(0, idx)
+
         return batch
 
     # --------------------------------------------------------------------- #
@@ -240,7 +244,7 @@ class G1HybridGymEnvBase(DirectRLEnv):
         low_ext = mid - pd_scale
         high_ext = mid + pd_scale
 
-        self._pd_action_offset = mid.to(self.device)
+        # self._pd_action_offset = mid.to(self.device)
         self._pd_action_scale = pd_scale.to(self.device)
         self._pd_action_limit_lower = low_ext.to(self.device)
         self._pd_action_limit_upper = high_ext.to(self.device)
@@ -250,8 +254,7 @@ class G1HybridGymEnvBase(DirectRLEnv):
             self._target_q = None
             return
 
-        a_no_clamp = actions.to(self.device)
-        a = a_no_clamp.clamp(-1.0, 1.0)
+        a = actions.clamp(-1.0, 1.0).to(self.device)
 
         with torch.no_grad():
             self._dbg_action_abs_mean = a.abs().mean(dim=-1)
