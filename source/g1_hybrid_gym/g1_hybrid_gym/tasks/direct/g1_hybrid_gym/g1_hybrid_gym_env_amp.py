@@ -117,13 +117,8 @@ class G1HybridGymEnvAMP(G1HybridGymEnvBase):
         self._body_npz_indices = torch.as_tensor(
             body_npz_indices, device=self.device, dtype=torch.long
         )
-        # print("Isaac Names:", [isaac_body_names[i] for i in body_isaac_indices])
-        # print("NPZ Names:", [npz_body_names[i] for i in body_npz_indices])
         tracked_isaac = [isaac_body_names[i] for i in self._body_isaac_indices.tolist()]
         tracked_npz = [npz_body_names[j] for j in self._body_npz_indices.tolist()]
-        # print("[AMP] Tracked Isaac Bodies:", tracked_isaac)
-        # print("[AMP] Tracked NPZ Bodies:", tracked_npz)
-        # devono corrispondere esattamente nello stesso ordine
         if tracked_isaac != tracked_npz:
             # trova il primo mismatch e stampalo bene
             for k, (a, b) in enumerate(zip(tracked_isaac, tracked_npz)):
@@ -133,8 +128,7 @@ class G1HybridGymEnvAMP(G1HybridGymEnvBase):
                     )
             raise ValueError("[AMP] Body mapping mismatch (length/order)")
 
-        # ------------- Contact bodies (da escludere nel maxdist) -------------
-        # Tipicamente piedi
+        # Contact bodies (da escludere nel maxdist)
         contact_names = ["left_ankle_roll_link", "right_ankle_roll_link"]
         contact_body_ids_local = []
         tracked_names = [isaac_body_names[i] for i in body_isaac_indices]
@@ -162,12 +156,8 @@ class G1HybridGymEnvAMP(G1HybridGymEnvBase):
         if self.dataset is None:
             return
 
-        # --- FIX: LAZY INITIALIZATION ---
-        # Se siamo chiamati dal __init__ del padre, i mapping non esistono ancora.
-        # Li creiamo ora.
         if not hasattr(self, "_body_npz_indices"):
             self._setup_body_mapping()
-        # --------------------------------
 
         # Root (body 0 nel NPZ -> già estratto nel dataset)
         self._ref_root_pos = self.dataset.root_pos_w
@@ -202,7 +192,7 @@ class G1HybridGymEnvAMP(G1HybridGymEnvBase):
             1, self._body_npz_indices
         )  # (T,K,4)
 
-        # EE positions for reward (same as PPO pipeline, paper-faithful)
+        # EE positions for reward (same as PPO pipeline)
         # body_pos_w: (T, B, 3) in NPZ body order
         # we select only the EE links in the same order as self.ee_names
         if self.ee_isaac_indices is not None and self._ee_npz_indices.numel() > 0:
@@ -315,8 +305,7 @@ class G1HybridGymEnvAMP(G1HybridGymEnvBase):
             goal_body_rot_wxyz = quat_normalize(ref["body_rot"])
 
             upper_body_ids = self._upper_body_ids
-
-            reset_f, term_f = compute_imitation_reset_max_posrot_upper(
+            _, term_f = compute_imitation_reset_max_posrot_upper(
                 reset_buf=reset_buf,
                 progress_buf=progress_buf,
                 curr_rigid_body_pos=curr_body_pos_rel,
@@ -327,11 +316,15 @@ class G1HybridGymEnvAMP(G1HybridGymEnvBase):
                 upper_body_ids=upper_body_ids,
                 max_episode_length=float(self.max_episode_length),
                 enable_early_termination=True,
-                pos_threshold=0.3,
-                rot_threshold_deg=90.0,
+                early_term_rot_threshold_deg=float(
+                    self.cfg_params.get("early_term_rot_threshold_deg", 90.0)
+                ),
+                early_termination_dist_threshold=float(
+                    self.cfg_params.get("early_termination_dist_threshold", 0.5)
+                ),
             )
         else:
-            reset_f, term_f = compute_imitation_reset_max(
+            _, term_f = compute_imitation_reset_max(
                 reset_buf=reset_buf,
                 progress_buf=progress_buf,
                 curr_rigid_body_pos=curr_body_pos_rel,
@@ -339,6 +332,9 @@ class G1HybridGymEnvAMP(G1HybridGymEnvBase):
                 contact_body_ids=self._contact_body_ids,
                 max_episode_length=float(self.max_episode_length),
                 enable_early_termination=True,
+                early_termination_dist_threshold=float(
+                    self.cfg_params.get("early_termination_dist_threshold", 0.5)
+                ),
             )
 
         term_amp = term_f > 0.5
@@ -359,6 +355,7 @@ def compute_imitation_reset_max(
     contact_body_ids: torch.Tensor,
     max_episode_length: float,
     enable_early_termination: bool,
+    early_termination_dist_threshold: float = 0.5,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     terminated = torch.zeros_like(reset_buf)
 
@@ -372,7 +369,7 @@ def compute_imitation_reset_max(
             pos_dist[:, contact_body_ids] = 0.0
 
         max_pos_dist = torch.max(pos_dist, dim=-1).values
-        has_deviated = max_pos_dist > 0.5
+        has_deviated = max_pos_dist > early_termination_dist_threshold
         # print("has_deviated:", has_deviated)
         terminated = torch.where(has_deviated, torch.ones_like(reset_buf), terminated)
 
@@ -394,8 +391,8 @@ def compute_imitation_reset_max_posrot_upper(
     upper_body_ids: torch.Tensor,  # (U,) local indices in K, non-empty recommended
     max_episode_length: float,
     enable_early_termination: bool,
-    pos_threshold: float,  # e.g. 0.2
-    rot_threshold_deg: float,  # e.g. 90.0
+    early_termination_dist_threshold: float,  # e.g. 0.2
+    early_term_rot_threshold_deg: float,  # e.g. 90.0
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     terminated = torch.zeros_like(reset_buf)
 
@@ -409,7 +406,7 @@ def compute_imitation_reset_max_posrot_upper(
         if contact_body_ids.numel() > 0:
             pos_dist[:, contact_body_ids] = 0.0
         max_pos_dist = torch.max(pos_dist, dim=-1).values  # (N,)
-        has_pos_deviated = max_pos_dist > pos_threshold
+        has_pos_deviated = max_pos_dist > early_termination_dist_threshold
 
         # -------------------------
         # ROT: max angle error on upper body only
@@ -431,7 +428,7 @@ def compute_imitation_reset_max_posrot_upper(
             # fallback: if empty, consider all (not recommended)
             max_ang_deg = torch.max(ang_deg, dim=-1).values
 
-        has_rot_deviated = max_ang_deg > rot_threshold_deg
+        has_rot_deviated = max_ang_deg > early_term_rot_threshold_deg
 
         # combine
         has_deviated = has_pos_deviated | has_rot_deviated

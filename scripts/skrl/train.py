@@ -14,6 +14,9 @@ parser.add_argument(
 parser.add_argument(
     "--num_envs", type=int, default=4096, help="Number of parallel environments"
 )
+parser.add_argument(
+    "--checkpoint", type=str, default=None, help="Path to checkpoint to resume training"
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -219,8 +222,8 @@ def main():
 
     cfg_amp["amp_batch_size"] = 1024
 
-    cfg_amp["task_reward_weight"] = 0.5
-    cfg_amp["style_reward_weight"] = 0.5
+    cfg_amp["task_reward_weight"] = 0.9
+    cfg_amp["style_reward_weight"] = 0.1
 
     cfg_amp["discriminator_loss_scale"] = 5.0
     cfg_amp["discriminator_batch_size"] = 8192
@@ -287,6 +290,9 @@ def main():
         reply_buffer=reply_buffer,  # Memoria vuota per replay
         collect_reference_motions=amp_motion_loader,
     )
+    if args_cli.checkpoint:
+        print(f"[Train] Resuming from checkpoint: {args_cli.checkpoint}")
+        agent.load(args_cli.checkpoint)
 
     # --- TRAINING ---
     print("Starting Training...")

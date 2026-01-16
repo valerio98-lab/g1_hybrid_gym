@@ -34,7 +34,7 @@ class G1HybridGymEnvCfg(DirectRLEnvCfg):
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=4096, env_spacing=4.0, replicate_physics=True
+        num_envs=8192, env_spacing=4.0, replicate_physics=True
     )
 
     # - action scale
