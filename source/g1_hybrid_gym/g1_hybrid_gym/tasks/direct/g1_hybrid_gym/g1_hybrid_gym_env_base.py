@@ -17,7 +17,7 @@ from isaaclab.envs import DirectRLEnv
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 
 from .g1_hybrid_gym_env_cfg import G1HybridGymEnvCfg
-from g1_hybrid_prior.dataset_builder import make_dataset
+from g1_hybrid_prior.dataset.dataset_builder import make_dataset
 from g1_hybrid_prior.helpers import (
     quat_normalize,
     quat_rotate,

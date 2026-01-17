@@ -23,9 +23,7 @@ args_cli = parser.parse_args()
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
-# --- 2. ALTRI IMPORT ---
 import torch
-import torch.nn as nn
 
 # SKRL IMPORTS
 from skrl.agents.torch.amp import AMP, AMP_DEFAULT_CONFIG
@@ -52,7 +50,6 @@ from g1_hybrid_gym.tasks.direct.g1_hybrid_gym.g1_hybrid_gym_env_cfg import (
 )
 from g1_hybrid_prior.expert_policy import LowLevelActor, LowLevelCritic
 import gymnasium as gym
-import torch
 
 
 class AMPLoggingWrapper(gym.Wrapper):
@@ -88,19 +85,15 @@ class AMPLoggingWrapper(gym.Wrapper):
     def step(self, action):
         obs, rew, terminated, truncated, infos = self.env.step(action)
 
-        # infos può essere dict o list; skrl/isaaclab wrapper di solito usa dict
         if infos is None:
             infos = {}
         if isinstance(infos, list):
-            # fallback raro: converti a dict vuoto
             infos = {}
 
         amp_obs = infos.get("amp_obs", None)  # (N, amp_dim)
         if amp_obs is None:
-            # se manca, non possiamo loggare style/combined
             return obs, rew, terminated, truncated, infos
         amp_obs = amp_obs.to(self.device)
-        # --- style reward identica a skrl.agents.torch.amp ---
         with torch.autocast(device_type=self.device_type, enabled=False):
             logits, _, _ = self.discriminator.act(
                 {"states": amp_obs}, role="discriminator"
@@ -144,7 +137,6 @@ class AMPLoggingWrapper(gym.Wrapper):
 def main():
     set_seed(42)
 
-    # --- CONFIG ENVIRONMENT ---
     env_cfg = G1HybridGymEnvCfg()
     env_cfg.scene.num_envs = args_cli.num_envs
     device = args_cli.device if args_cli.device else "cuda:0"
@@ -156,7 +148,6 @@ def main():
     )
     env = wrap_env(env_custom, wrapper="isaaclab")
 
-    # --- CONFIG RETI ---
     full_obs_dim = env.observation_space.shape[0]
     state_dim = full_obs_dim // 2
     action_dim = env.action_space.shape[0]
@@ -179,7 +170,7 @@ def main():
         curr = env
         while hasattr(curr, "env"):
             curr = curr.env
-        return curr  # dovrebbe essere G1HybridGymEnvAMP
+        return curr
 
     custom_env = unwrap_to_custom(env)
 
@@ -200,7 +191,6 @@ def main():
 
     models = {"policy": policy, "value": value, "discriminator": discriminator}
 
-    # --- CONFIGURAZIONE AMP (Paper Parameters) ---
     cfg_amp = AMP_DEFAULT_CONFIG.copy()
 
     cfg_amp["learning_rate"] = 5e-5
@@ -240,8 +230,7 @@ def main():
     # env = AMPLoggingWrapper(env, discriminator, cfg_amp, device)
 
     # ------------------------------------------------------------------------
-    # 2. DEFINIZIONE FUNZIONE LOADER (Cruciale per questa versione di SKRL)
-    # ------------------------------------------------------------------------
+    # Funzione Loader
     # Questa funzione viene chiamata dall'agente dentro __init__ e durante il training
     # per pescare batch casuali dal tensore statico.
     def amp_motion_loader(n_samples: int):
@@ -250,33 +239,23 @@ def main():
     demo = amp_motion_loader(8)
     print("[Train] Demo sample dim:", demo.shape, flush=True)  # deve essere (8, K*69)
 
-    # ------------------------------------------------------------------------
-    # 3. PREPARAZIONE MEMORIE
-    # ------------------------------------------------------------------------
-
-    # A. Memoria principale (Rollouts)
+    # Memoria principale (Rollouts)
     memory = RandomMemory(
         memory_size=cfg_amp["rollouts"], num_envs=env.num_envs, device=device
     )
 
-    # B. Motion Dataset (Dati Esperto) - Deve essere grande per contenere il dataset
-    # Mettiamo 200k o la dimensione del dataset x 2 per stare larghi
+    # Motion Dataset (Dati Esperto) - Deve essere grande per contenere il dataset
     motion_dataset = RandomMemory(
         memory_size=200000, num_envs=1, device=device, replacement=False
     )
 
-    # C. Reply Buffer (Dati Discriminatore) - Serve a stabilizzare il GAN
+    # Reply Buffer (Dati Discriminatore) - Serve a stabilizzare il GAN
     reply_buffer = RandomMemory(
         memory_size=1000000, num_envs=1, device=device, replacement=False
     )
 
-    # ------------------------------------------------------------------------
-    # 4. ISTANZIAZIONE AGENTE
-    # ------------------------------------------------------------------------
     print("[Train] Instantiating AMP Agent with Loader Function...")
 
-    # Notare gli argomenti extra: motion_dataset, reply_buffer, collect_reference_motions
-    # Questi corrispondono alla firma __init__ del codice sorgente che hai mandato.
     agent = AMP(
         models=models,
         memory=memory,
@@ -284,9 +263,8 @@ def main():
         observation_space=env.observation_space,
         action_space=env.action_space,
         device=device,
-        # Argomenti specifici AMP
         amp_observation_space=custom_env.amp_observation_space,  # Dimensione dello stato AMP (69)
-        motion_dataset=motion_dataset,  # Memoria vuota (verrà riempita dal loader)
+        motion_dataset=motion_dataset,
         reply_buffer=reply_buffer,  # Memoria vuota per replay
         collect_reference_motions=amp_motion_loader,
     )
@@ -294,7 +272,6 @@ def main():
         print(f"[Train] Resuming from checkpoint: {args_cli.checkpoint}")
         agent.load(args_cli.checkpoint)
 
-    # --- TRAINING ---
     print("Starting Training...")
     trainer_cfg = {
         "timesteps": 500_000,

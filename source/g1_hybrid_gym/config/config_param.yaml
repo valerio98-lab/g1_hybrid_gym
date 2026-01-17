@@ -1,12 +1,14 @@
 dataset_params: 
-  training_type: "ppo_amp" # "ppo_amp" or "ppo"
-  dataset_path: "/home/valerio/g1_hybrid_prior/data_amp/LAFAN-G1/LAFAN_walk1_subject1_0_-1.npz"
-  robot: "g1_amp" # "g1" or "g1_amp"
+  training_type: "ppo" # "ppo_amp" or "ppo"
+  dataset_path: "/home/valerio/g1_hybrid_prior/data_raw/LAFAN1_Retargeting_Dataset/g1_ee_augmented_partial_data"
+  robot: "g1" # "g1" or "g1_amp"
   dataset_type: "augmented" # "raw" or "augmented"
   lazy_load: False
   vel_mode: "central" # "central" or "backward"
   num_amp_obs_steps : 2
-  max_rot_reset: True
+  max_rot_reset: False
+  early_termination_dist_threshold: 0.5
+  early_term_rot_threshold_deg: 90.0
   upper_names:
     - "left_shoulder_pitch_link"
     - "left_shoulder_roll_link"

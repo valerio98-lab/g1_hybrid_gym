@@ -8,7 +8,7 @@ from typing import Tuple, Sequence
 import gymnasium as gym
 
 from .g1_hybrid_gym_env_base import G1HybridGymEnvBase
-from g1_hybrid_prior.dataset_builder import make_dataset
+from g1_hybrid_prior.dataset.dataset_builder import make_dataset
 from g1_hybrid_prior.helpers import quat_normalize, quat_rotate_inv
 
 

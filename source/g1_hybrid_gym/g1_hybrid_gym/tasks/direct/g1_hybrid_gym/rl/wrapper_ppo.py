@@ -1,10 +1,9 @@
 import torch
-import yaml
 from rl_games.algos_torch.models import ModelA2CContinuousLogStd
-from g1_hybrid_prior.expert_policy import LowLevelExpertPolicy
+from g1_hybrid_prior.models.expert_policy import ExpertPolicy
 
 
-class ExpertLowLevelPolicy(ModelA2CContinuousLogStd):
+class ExpertPolicyWrapper(ModelA2CContinuousLogStd):
     def __init__(self, network):
         super().__init__(network)
 
@@ -12,13 +11,13 @@ class ExpertLowLevelPolicy(ModelA2CContinuousLogStd):
         obs_shape = config["input_shape"]  # (127,)
         if len(obs_shape) != 1:
             raise RuntimeError(
-                f"[ExpertLowLevelPolicy] Only flat obs supported, got shape={obs_shape}"
+                f"[ExpertPolicyWrapper] Only flat obs supported, got shape={obs_shape}"
             )
 
-        full_obs_dim = obs_shape[0]  
+        full_obs_dim = obs_shape[0]
         if (full_obs_dim) % 2 != 0:
             raise RuntimeError(
-                f"[ExpertLowLevelPolicy] Expected obs = [s_cur, s_ref] s_cur(69) + s_ref(69) = 138, "
+                f"[ExpertPolicyWrapper] Expected obs = [s_cur, s_ref] s_cur(69) + s_ref(69) = 138, "
                 f"but got dim={full_obs_dim}"
             )
 
@@ -29,11 +28,11 @@ class ExpertLowLevelPolicy(ModelA2CContinuousLogStd):
         device = config.get("device", "cuda:0")
 
         print(
-            f"[ExpertLowLevelPolicy] obs_dim={obs_dim}, goal_dim={goal_dim}, action_dim={action_dim}"
+            f"[ExpertPolicyWrapper] obs_dim={obs_dim}, goal_dim={goal_dim}, action_dim={action_dim}"
         )
-        print(f"[ExpertLowLevelPolicy] CONFIG KEYS: {config.keys()}")
+        print(f"[ExpertPolicyWrapper] CONFIG KEYS: {config.keys()}")
 
-        expert_policy = LowLevelExpertPolicy(
+        expert_policy = ExpertPolicy(
             obs_dim=obs_dim,
             goal_dim=goal_dim,
             action_dim=action_dim,
@@ -59,7 +58,7 @@ class ExpertLowLevelPolicy(ModelA2CContinuousLogStd):
 
             if full_dim % 2 != 0:
                 raise RuntimeError(
-                    f"[ExpertLowLevelPolicy.Network] obs dim={full_dim} is not even; "
+                    f"[ExpertPolicyWrapper.Network] obs dim={full_dim} is not even; "
                     f"expected [s_cur, s_ref]"
                 )
             self.state_dim = full_dim // 2  # dim di s_cur (e s_ref)
