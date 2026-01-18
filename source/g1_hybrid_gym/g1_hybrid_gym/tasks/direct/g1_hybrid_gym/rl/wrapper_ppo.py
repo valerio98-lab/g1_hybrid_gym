@@ -8,7 +8,7 @@ class ExpertPolicyWrapper(ModelA2CContinuousLogStd):
         super().__init__(network)
 
     def build(self, config):
-        obs_shape = config["input_shape"]  # (127,)
+        obs_shape = config["input_shape"]  # (138,)
         if len(obs_shape) != 1:
             raise RuntimeError(
                 f"[ExpertPolicyWrapper] Only flat obs supported, got shape={obs_shape}"
