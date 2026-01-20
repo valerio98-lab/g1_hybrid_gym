@@ -8,12 +8,14 @@ from typing import Dict, Tuple
 import torch
 import yaml
 
+from tqdm import tqdm
+
 from isaaclab.app import AppLauncher
 
 import g1_hybrid_gym.tasks  # noqa: F401
 
 from g1_hybrid_gym.tasks.direct.g1_hybrid_gym.g1_hybrid_gym_env_cfg import G1HybridGymEnvCfg
-from g1_hybrid_gym.tasks.direct.g1_hybrid_gym.g1_hybrid_gym_env_ppo import G1HybridGymEnvPPO
+from g1_hybrid_gym.tasks.direct.g1_hybrid_gym.g1_hybrid_gym_env_imitation import G1HybridGymEnvImitation
 
 from g1_hybrid_prior.models.expert_policy import ExpertPolicy
 from g1_hybrid_prior.models.hybrid_imitation_block import ImitationBlock, LossWeights
@@ -66,6 +68,8 @@ def main():
                         help="Path to YAML containing imitation_learning_policy section")
     parser.add_argument("--expert_checkpoint", type=str, default=None,
                         help="(Optional) path to expert checkpoint if you load weights manually")
+    parser.add_argument("--debug_temporal", action="store_true",
+                        help="Enable extra temporal consistency checks")
 
     AppLauncher.add_app_launcher_args(parser)
 
@@ -94,7 +98,7 @@ def main():
     env_cfg.sim.device = str(device)
 
     # create env
-    env = G1HybridGymEnvPPO(cfg=env_cfg, render_mode=None)
+    env = G1HybridGymEnvImitation(cfg=env_cfg, render_mode=None)
 
     # infer dims from env
     obs = _reset_env(env)
@@ -163,33 +167,46 @@ def main():
     else:
         raise RuntimeError("Env must expose env.unwrapped.ref_frame_idx for definitive temporal masking.")
         
-    for it in range(args.steps):
+    for it in tqdm(range(args.steps), desc="Training Imitation"):
         obs_policy = obs["policy"]
         s, goal = _split_obs(obs_policy)
         valid_prev = (~done_prev) & (~wrap_prev)
 
-        mu_expert = _get_mu_expert(expert, s, goal)
-
-        stats = trainer.train_step({"s": s, "goal": goal, "a_expert": mu_expert, "valid_prev": valid_prev})
+        mu_expert = _get_mu_expert(expert, s, goal).to(device=device)
 
         # teacher forcing rollout
         obs, rew, terminated, truncated, extras = _step_env(env, mu_expert)
-        
-        done_prev = (terminated | truncated).to(device=device, dtype=torch.bool)
+        done_after_step = (terminated | truncated).to(device=device, dtype=torch.bool)
         new_ref_idx = env.unwrapped.ref_frame_idx
-        wrap_prev = torch.zeros_like(done_prev)
-        if prev_ref_idx is None:
-            prev_ref_idx = new_ref_idx.clone()
-        else:
-            # wrap if it jumped to 0 without being a reset transition
-            wrap_prev = (new_ref_idx == 0) & (prev_ref_idx != 0) & (~done_prev)
-            prev_ref_idx = new_ref_idx.clone()
+
+        wrap_now = (new_ref_idx == 0) & (prev_ref_idx != 0) & (~done_after_step)
+        valid_prev = (~done_prev) & (~wrap_now)
+
+        if args.debug_temporal:
+            if valid_prev.any():
+                expected = prev_ref_idx + 1
+                bad = valid_prev & (new_ref_idx != expected)
+                if bad.any():
+                    i = bad.nonzero(as_tuple=False)[0].item()
+                    raise RuntimeError(
+                        f"Temporal mismatch at env {i}: prev_ref={prev_ref_idx[i].item()} "
+                        f"new_ref={new_ref_idx[i].item()} (expected {expected[i].item()})"
+                    )
+
+        stats = trainer.train_step({"s": s, "goal": goal, "a_expert": mu_expert, "valid_prev": valid_prev})
+
+        done_prev = done_after_step
+        prev_ref_idx = new_ref_idx.clone()
+        wrap_prev = wrap_now
 
         if (it + 1) % 1000 == 0:
+            valid_ratio = valid_prev.float().mean().item()
+
             print(
                 f"[it={it+1}] loss_total={stats['loss_total']:.4f} "
                 f"loss_action={stats['loss_action']:.4f} loss_mm={stats['loss_mm']:.4f} "
-                f"loss_commit={stats.get('loss_commit', 0.0):.4f}"
+                f"loss_commit={stats.get('loss_commit', 0.0):.4f} "
+                f"... valid_prev={valid_ratio:.3f}"
             )
 
     env.close()
