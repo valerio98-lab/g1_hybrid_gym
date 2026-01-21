@@ -1,6 +1,6 @@
 dataset_params: 
-  training_type: "ppo" # "ppo_amp" or "ppo"
-  dataset_path: "/home/valerio/g1_hybrid_prior/data_raw/LAFAN1_Retargeting_Dataset/g1_ee_augmented_partial_data"
+  training_type: "imitation_learning" # "ppo_amp", "ppo", "imitation_learning"
+  dataset_path: "/home/valerio/g1_hybrid_prior/data_raw/LAFAN1_Retargeting_Dataset/g1_body_fk_npz_partial"
   robot: "g1" # "g1" or "g1_amp"
   dataset_type: "augmented" # "raw" or "augmented"
   lazy_load: False
@@ -27,3 +27,5 @@ dataset_params:
 
 
 #/home/valerio/g1_hybrid_prior/data_raw/LAFAN1_Retargeting_Dataset/g1_ee_augmented/walk1_subject1.csv
+#/home/valerio/g1_hybrid_prior/data_raw/LAFAN1_Retargeting_Dataset/g1_ee_augmented_partial_data
+

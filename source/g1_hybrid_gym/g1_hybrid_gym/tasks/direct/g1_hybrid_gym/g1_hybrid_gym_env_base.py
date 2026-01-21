@@ -49,14 +49,12 @@ class G1HybridGymEnvBase(DirectRLEnv):
     ):
         super().__init__(cfg, render_mode, **kwargs)
 
-        # ---------- Dataset ----------
         self.dataset = self._load_dataset()
         self.max_frame_idx = len(self.dataset) - 1
         print(
             f"[{self.__class__.__name__}] Loaded dataset with {len(self.dataset)} frames"
         )
 
-        # ---------- Joint Mapping ----------
         dataset_joint_names = self.dataset.robot_cfg.joint_order
         isaac_joint_names = self.robot.joint_names
 
@@ -96,7 +94,6 @@ class G1HybridGymEnvBase(DirectRLEnv):
                 f"g1_dof_idx:      {names2}"
             )
 
-        # ---------- End-effector mapping (optional for derived envs) ----------
         self.ee_names = getattr(self.dataset.robot_cfg, "ee_link_names", [])
         self.ee_isaac_indices = None
         if self.ee_names:
@@ -115,10 +112,8 @@ class G1HybridGymEnvBase(DirectRLEnv):
                 f"[{self.__class__.__name__}] Mapped EE: {self.ee_names} -> {self.ee_isaac_indices.tolist()}"
             )
 
-        # ---------- PD action scaling ----------
         self._build_pd_action_offset_scale()
 
-        # ---------- Reference indexing ----------
         self.ref_frame_idx = torch.zeros(
             self.num_envs, dtype=torch.long, device=self.device
         )
@@ -151,9 +146,7 @@ class G1HybridGymEnvBase(DirectRLEnv):
         self._dbg_root_pos_mse: torch.Tensor | None = None
         self._dbg_ee_pos_mse: torch.Tensor | None = None
 
-    # --------------------------------------------------------------------- #
-    # Dataset hooks
-    # --------------------------------------------------------------------- #
+
 
     def _read_dataset_params(self) -> dict:
         cfg_params_path = str(PARENT_DIR / "config" / "config_param.yaml")
@@ -212,10 +205,6 @@ class G1HybridGymEnvBase(DirectRLEnv):
 
         return batch
 
-    # --------------------------------------------------------------------- #
-    # Scene / actions
-    # --------------------------------------------------------------------- #
-
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot_cfg)
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
@@ -271,10 +260,6 @@ class G1HybridGymEnvBase(DirectRLEnv):
         if getattr(self, "_target_q", None) is None:
             return
         self.robot.set_joint_position_target(self._target_q, joint_ids=self._g1_dof_idx)
-
-    # --------------------------------------------------------------------- #
-    # Obs / goal
-    # --------------------------------------------------------------------- #
 
     def _build_goal_from_ref(
         self,
@@ -354,7 +339,6 @@ class G1HybridGymEnvBase(DirectRLEnv):
             log["ee_maxdist_p95"] = float(_p95(self._dbg_maxdist).item())
             log["ee_maxdist_max"] = float(_max(self._dbg_maxdist).item())
 
-        # ---- MSE terms ----
         if self._dbg_joint_pos_mse is not None:
             log["mse_joint_pos"] = _mean(self._dbg_joint_pos_mse).item()
         if self._dbg_joint_vel_mse is not None:
@@ -364,7 +348,6 @@ class G1HybridGymEnvBase(DirectRLEnv):
         if self._dbg_ee_pos_mse is not None:
             log["mse_ee_pos"] = _mean(self._dbg_ee_pos_mse).item()
 
-        # ---- action stats (arrivate all'env) ----
         if self._dbg_action_abs_mean is not None:
             log["action_abs_mean"] = _mean(self._dbg_action_abs_mean).item()
         if self._dbg_action_sat_frac is not None:
@@ -417,9 +400,6 @@ class G1HybridGymEnvBase(DirectRLEnv):
 
         return {"policy": obs}
 
-    # --------------------------------------------------------------------- #
-    # Dones / reset / rewards
-    # --------------------------------------------------------------------- #
 
     def _get_dones(self):
         """Base: solo timeout + fallen. I figli possono estendere con early termination."""
