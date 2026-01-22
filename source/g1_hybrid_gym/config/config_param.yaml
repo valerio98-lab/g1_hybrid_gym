@@ -28,4 +28,5 @@ dataset_params:
 
 #/home/valerio/g1_hybrid_prior/data_raw/LAFAN1_Retargeting_Dataset/g1_ee_augmented/walk1_subject1.csv
 #/home/valerio/g1_hybrid_prior/data_raw/LAFAN1_Retargeting_Dataset/g1_ee_augmented_partial_data
+#/home/valerio/g1_hybrid_prior/data_raw/LAFAN1_Retargeting_Dataset/g1_body_fk_npz_partial
 
