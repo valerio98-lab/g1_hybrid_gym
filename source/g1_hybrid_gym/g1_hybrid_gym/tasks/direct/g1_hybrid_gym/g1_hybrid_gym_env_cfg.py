@@ -46,7 +46,7 @@ class G1HybridGymEnvCfg(DirectRLEnvCfg):
     rew_w_vel = 0.1  # Paper Eq.10: r_alpha uses -0.5 (Abbassato per stabilità infatti usano 0.1 nel codice)
     rew_w_root_pos = 10.0  # Paper Eq.10: r_root uses -10.
     rew_w_root_rot = 0  # Non nel paper ma utile per stabilità. Al momento non usiamo rotazione del root
-    rew_w_ee = 40.0  # Paper Eq.10: r_ee uses -40 (Molto alto!)
+    rew_w_ee = 40.0  # Paper Eq.10: r_ee uses -40
 
     rew_alive = 0.0  # Additivo. Attualmente non usato, spingeva il robot a stare in piedi ignorando il tracking
 
