@@ -55,14 +55,15 @@ class TaskA2CNetwork(nn.Module):
         g = obs[..., self.s_dim :]
 
         # High-level policy logits
-        hl_out = self.task_block.high_level(s, g)
+        s_norm = self.task_block._normalize_s(s)
+        hl_out = self.task_block.high_level(s_norm, g)
         logits = hl_out["logits"]  # (B, num_active_codebooks, codebook_size)
 
         # ModelA2CMultiDiscrete expects a list of (B, codebook_size)
         logits_list = [logits[:, q, :] for q in range(logits.shape[1])]
 
         # Critic
-        value = self.critic(s, g)  # (B, 1)
+        value = self.critic(s_norm, g)
 
         return logits_list, value, None
 
@@ -79,10 +80,11 @@ class TaskA2CNetwork(nn.Module):
         Returns:
             action:  (B, action_dim) joint position targets
         """
-        zp = self.task_block.imitation.prior(s)
+        s_norm = self.task_block._normalize_s(s)
+        zp = self.task_block.imitation.prior(s_norm)
         y_bar = self.task_block._lookup_codebook(indices)
         z_bar = y_bar + zp
-        action = self.task_block.imitation.decoder(s, z_bar)
+        action = self.task_block.imitation.decoder(s_norm, z_bar)
         return action
 
     def is_rnn(self):

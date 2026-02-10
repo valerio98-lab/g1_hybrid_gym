@@ -63,13 +63,11 @@ class TaskEnvWrapper(gym.Wrapper):
             obs, info = obs
         else:
             info = {}
-
         if isinstance(obs, dict):
             self._last_obs_policy = obs["policy"]
         else:
             self._last_obs_policy = obs
-
-        return obs, info
+        return self._last_obs_policy
 
     def step(self, action):
         """
@@ -97,8 +95,10 @@ class TaskEnvWrapper(gym.Wrapper):
             self._last_obs_policy = obs["policy"]
         else:
             self._last_obs_policy = obs
+        
+        done = (terminated | truncated).to(dtype=torch.float32)
 
-        return obs, reward, terminated, truncated, extras
+        return self._last_obs_policy, reward, done, {} if extras is None else extras
 
     def _get_device(self):
         if hasattr(self.env, "device"):
