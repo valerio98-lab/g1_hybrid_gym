@@ -1,12 +1,7 @@
-# train_task.py
 """
 Task Learning training via rl_games PPO (ModelA2CMultiDiscrete).
-
-Usage:
-  python train_task.py \
-    --imitation_ckpt /path/to/imitation/ckpt_best.pt \
-    --num_envs 8192
 """
+
 from __future__ import annotations
 
 import argparse
@@ -19,7 +14,7 @@ from isaaclab.app import AppLauncher
 def main():
     parser = argparse.ArgumentParser("Task Learning — rl_games PPO MultiDiscrete")
 
-    parser.add_argument("--num_envs", type=int, default=8192)
+    parser.add_argument("--num_envs", type=int, default=4096)
     parser.add_argument("--max_iterations", type=int, default=10_000)
     parser.add_argument(
         "--log_dir", type=str,
@@ -31,7 +26,7 @@ def main():
     parser.add_argument("--task_goal_dim", type=int, default=3)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--horizon", type=int, default=16)
-    parser.add_argument("--minibatch_size", type=int, default=None)
+    parser.add_argument("--minibatch_size", type=int, default=32768)
     parser.add_argument("--entropy_coef", type=float, default=0.01)
     parser.add_argument("--resume", type=str, default=None)
 
@@ -41,7 +36,6 @@ def main():
     app_launcher = AppLauncher(args)
     simulation_app = app_launcher.app
 
-    # -- Imports after AppLauncher --
     import torch
 
     import g1_hybrid_gym.tasks  # noqa: register envs
@@ -64,6 +58,65 @@ def main():
     env_cfg.sim.device = device
 
     base_env = G1HybridGymEnvTask(cfg=env_cfg, render_mode=None)
+
+
+    batch_size = args.num_envs * args.horizon
+    minibatch_size = args.minibatch_size or batch_size
+
+    rl_config = {
+        "params": {
+            "seed": 42,
+            "algo": {
+                "name": "a2c_discrete",
+            },
+            "model": {
+                "name": "wrapper_expert_task_ppo",
+            },
+            "network": {
+                "name": "task_a2c",
+            },
+        "env": {
+            "clip_observations": 5.0,
+            "clip_actions": 1.0,
+        },
+            "config": {
+                "name": args.run_name,
+                "log_dir": args.log_dir,
+                "train_dir": args.log_dir,
+                "env_name": "isaaclab_task",
+                "multi_gpu": False,
+                "mixed_precision": False,
+                "normalize_input": False,
+                "normalize_value": True,
+                "value_bootstrap": True,
+                "num_actors": args.num_envs,
+                "reward_shaper": {"scale_value": 1.0},
+                "normalize_advantage": True,
+                "gamma": 0.99,
+                "tau": 0.95,
+                "learning_rate": args.lr,
+                "lr_schedule": "constant",
+                "score_to_win": 1e6,
+                "max_epochs": args.max_iterations,
+                "save_best_after": 50,
+                "save_frequency": 100,
+                "grad_norm": 1.0,
+                "entropy_coef": args.entropy_coef,
+                "truncate_grads": True,
+                "e_clip": 0.2,
+                "horizon_length": args.horizon,
+                "minibatch_size": minibatch_size,
+                "mini_epochs": 4,
+                "critic_coef": 5,
+                "clip_value": True,
+                "seq_length": 4,
+                "bounds_loss_coef": 10.0,
+            },
+        },
+    }
+
+    from isaaclab_rl.rl_games import RlGamesVecEnvWrapper
+    env_rl = RlGamesVecEnvWrapper(base_env, rl_device=device, clip_obs=rl_config["params"]["env"]["clip_observations"], clip_actions=rl_config["params"]["env"]["clip_actions"])
 
     obs_reset = base_env.reset()
     if isinstance(obs_reset, tuple):
@@ -100,16 +153,14 @@ def main():
     num_active = task_block.num_active_codebooks
     print(f"[INFO] codebook_size={codebook_size}, num_active_codebooks={num_active}")
 
-    # ---- 3. Wrap env ----
     env = TaskEnvWrapper(
-        env=base_env,
+        env=env_rl,
         a2c_network=a2c_network,
         s_dim=s_dim,
         num_active_codebooks=num_active,
         codebook_size=codebook_size,
     )
 
-    # ---- 4. Register with rl_games ----
     vecenv.register(
         "ISAACLAB_TASK",
         lambda config_name, num_actors, **kwargs: env,
@@ -121,10 +172,6 @@ def main():
             "env_creator": lambda **kwargs: env,
         },
     )
-
-    # Register model — but we want rl_games to use the SAME a2c_network
-    # we already built (shared with env wrapper).
-    # We override build() to return our pre-built network.
     class PrebuiltTaskWrapper(TaskPolicyWrapper):
         """Uses the pre-built a2c_network instead of constructing a new one."""
         def build(self, config):
@@ -146,57 +193,7 @@ def main():
         lambda network, **kwargs: PrebuiltTaskWrapper(network),
     )
 
-    # ---- 5. rl_games config ----
-    batch_size = args.num_envs * args.horizon
-    minibatch_size = args.minibatch_size or batch_size
 
-    rl_config = {
-        "params": {
-            "seed": 42,
-            "algo": {
-                "name": "a2c_discrete",
-            },
-            "model": {
-                "name": "wrapper_expert_task_ppo",
-            },
-            "network": {
-                "name": "task_a2c",
-            },
-            "config": {
-                "name": args.run_name,
-                "env_name": "isaaclab_task",
-                "multi_gpu": False,
-                "mixed_precision": False,
-                "normalize_input": False,
-                "normalize_value": True,
-                "value_bootstrap": True,
-                "num_actors": args.num_envs,
-                "reward_shaper": {"scale_value": 1.0},
-                "normalize_advantage": True,
-                "gamma": 0.99,
-                "tau": 0.95,
-                "learning_rate": args.lr,
-                "lr_schedule": "constant",
-                "score_to_win": 1e6,
-                "max_epochs": args.max_iterations,
-                "save_best_after": 50,
-                "save_frequency": 100,
-                "grad_norm": 1.0,
-                "entropy_coef": args.entropy_coef,
-                "truncate_grads": True,
-                "e_clip": 0.1,
-                "horizon_length": args.horizon,
-                "minibatch_size": minibatch_size,
-                "mini_epochs": 4,
-                "critic_coef": 0.5,
-                "clip_value": True,
-                "seq_length": 4,
-                "bounds_loss_coef": 10.0,
-            },
-        },
-    }
-
-    # ---- 6. Train ----
     os.makedirs(args.log_dir, exist_ok=True)
 
     runner = Runner(IsaacAlgoObserver())

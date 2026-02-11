@@ -17,7 +17,11 @@ from .g1_hybrid_gym_env_cfg import G1HybridGymEnvCfg
 from g1_hybrid_prior.helpers import (
     quat_normalize,
     quat_rotate_inv,
+    quat_rotate,
+    quat_mul
 )
+from isaaclab.envs import DirectRLEnv
+
 
 
 class G1HybridGymEnvTask(G1HybridGymEnvBase):
@@ -46,22 +50,19 @@ class G1HybridGymEnvTask(G1HybridGymEnvBase):
         self.omega_range = tuple(task_cfg.get("omega_range", [-0.8, 0.8]))
 
         # Command resampling interval (seconds)
-        self.cmd_resample_seconds = float(task_cfg.get("cmd_resample_seconds", 3.0))
+        self.cmd_resample_seconds = float(task_cfg.get("cmd_resample_seconds", 2.5))
         self.cmd_resample_steps = int(
             self.cmd_resample_seconds / (self.cfg.sim.dt * self.cfg.decimation)
         )
 
-        # Reward weights
         self.rew_w_lin_vel = float(task_cfg.get("rew_w_lin_vel", 1.0))
         self.rew_w_ang_vel = float(task_cfg.get("rew_w_ang_vel", 0.5))
         self.rew_w_lin_vel_penalty = float(task_cfg.get("rew_w_lin_vel_penalty", 2.0))
         self.rew_w_ang_vel_penalty = float(task_cfg.get("rew_w_ang_vel_penalty", 1.0))
 
-        # ---- Velocity command buffers ----
         self.vel_cmd = torch.zeros(self.num_envs, 3, device=self.device)
         self.cmd_timer = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
-        # ---- Infer s_dim from base obs ----
         J = len(self.dataset.robot_cfg.joint_order)
         self.s_dim = 1 + 4 + 3 + 3 + J + J  # 69 for G1
         self.task_goal_dim = 3
@@ -121,8 +122,8 @@ class G1HybridGymEnvTask(G1HybridGymEnvBase):
     def _get_rewards(self) -> torch.Tensor:
         """
         Velocity tracking reward:
-          r = w_lin * exp(-k_lin * ||v_xy - v_cmd_xy||²)
-            + w_ang * exp(-k_ang * (ω_z - ω_cmd)²)
+          r = w_lin * exp(-r_lin * ||v_xy - v_cmd_xy||²)
+            + w_ang * exp(-r_ang * (ω_z - ω_cmd)²)
         """
         v_body = self._cached_lin_vel_body
         w_body = self._cached_ang_vel_body
@@ -171,14 +172,69 @@ class G1HybridGymEnvTask(G1HybridGymEnvBase):
 
         return terminated, time_out
 
+
     def _reset_idx(self, env_ids):
-        """Reset environments and resample velocity commands."""
         if env_ids is None:
             env_ids = self.robot._ALL_INDICES
         env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
 
-        super()._reset_idx(env_ids)
+        DirectRLEnv._reset_idx(self, env_ids)
+
+        n = len(env_ids)
+
+        # RSI
+        min_episode_frames = 60
+        max_start = max(0, self.max_frame_idx - min_episode_frames)
+        random_starts = torch.randint(0, max_start + 1, (n,), device=self.device)
+        self.ref_frame_idx[env_ids] = random_starts
+
+        root_pos_0 = self._ref_root_pos[random_starts]
+        root_quat_0 = self._ref_root_quat_wxyz[random_starts]
+        root_lin_vel_0_body = self._ref_root_lin_vel[random_starts].clone()
+        root_ang_vel_0_body = self._ref_root_ang_vel[random_starts].clone()
+        joints_0 = self._ref_joints[random_starts]
+        joint_vel_0 = self._ref_joint_vel[random_starts]
+
+        # Heading Randomization 
+        rand_yaw = (torch.rand(n, device=self.device) * 2.0 - 1.0) * torch.pi
+        cy = torch.cos(rand_yaw * 0.5)
+        sy = torch.sin(rand_yaw * 0.5)
+        zeros = torch.zeros_like(cy)
+        q_rand_yaw = torch.stack([cy, zeros, zeros, sy], dim=-1)
+
+        root_quat_w = quat_normalize(quat_mul(q_rand_yaw, root_quat_0))
+
+        root_lin_vel_0_body += (torch.rand(n, 3, device=self.device) * 2 - 1) * 0.1
+        ang_vel_noise = (torch.rand(n, 3, device=self.device) * 2 - 1) * 0.05
+        ang_vel_noise[:, 2] *= 0.1
+        root_ang_vel_0_body += ang_vel_noise
+
+        env_origins = self.scene.env_origins[env_ids]
+        root_pos_w = root_pos_0 + env_origins
+
+        v_link_w = quat_rotate(root_quat_w, root_lin_vel_0_body)
+        w_w = quat_rotate(root_quat_w, root_ang_vel_0_body)
+        r_body = self.robot.data.body_com_pos_b[env_ids, 0]
+        r_w = quat_rotate(root_quat_w, r_body)
+        v_com_w = v_link_w + torch.linalg.cross(w_w, r_w, dim=-1)
+
+        default_root_state = self.robot.data.default_root_state[env_ids].clone()
+        default_root_state[:, 0:3] = root_pos_w
+        default_root_state[:, 3:7] = root_quat_w
+        default_root_state[:, 7:10] = v_com_w
+        default_root_state[:, 10:13] = w_w
+
+        default_joint_pos = self.robot.data.default_joint_pos[env_ids].clone()
+        default_joint_vel = self.robot.data.default_joint_vel[env_ids].clone()
+        default_joint_pos[:, self.dataset_to_isaac_indexes] = joints_0
+        default_joint_vel[:, self.dataset_to_isaac_indexes] = joint_vel_0
+
+        self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
+        self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
+        self.robot.write_joint_state_to_sim(default_joint_pos, default_joint_vel, None, env_ids)
+
         self._resample_commands(env_ids)
+        self._cached_ref_tensors = None
 
     def step(self, action):
         """Override to add task-specific logging."""
