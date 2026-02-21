@@ -17,7 +17,6 @@ class G1HybridGymEnvPPO(G1HybridGymEnvBase):
     def _get_dones(self):
         terminated, time_out = super()._get_dones()
 
-        # Early termination su EE (il tuo comportamento attuale)
         ref = self._cached_ref_tensors
         if ref is None:
             self.ref_frame_idx.clamp_(0, self.max_frame_idx)

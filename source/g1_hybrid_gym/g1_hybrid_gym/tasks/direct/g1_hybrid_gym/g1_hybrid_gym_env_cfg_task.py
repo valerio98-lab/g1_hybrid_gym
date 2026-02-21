@@ -10,7 +10,7 @@ from .g1_hybrid_gym_env_cfg import G1HybridGymEnvCfg
 
 @configclass
 class G1HybridGymEnvTaskCfg(G1HybridGymEnvCfg):
-    episode_length_s = 5.0
+    episode_length_s = 6.0
 
     # Observation: s_cur(69) + vel_cmd(3) = 72
     observation_space = 72

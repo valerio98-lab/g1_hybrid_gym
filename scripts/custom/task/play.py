@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import torch
+import ast
 
 from isaaclab.app import AppLauncher
 
@@ -27,11 +28,17 @@ def main():
     parser.add_argument("--task_goal_dim", type=int, default=3)
     parser.add_argument("--max_steps", type=int, default=5000, help="Max steps to run (0=infinite)")
     parser.add_argument("--deterministic", action="store_true", help="Use argmax instead of sampling")
+    parser.add_argument("--random", action="store_true", help="Use random actions")
+    parser.add_argument("--random_range", type=str, help="Range for random actions (if --random is set). If not provided, defaults to [0, codebook_size].")
 
     # Fixed velocity command (optional, otherwise random resampling)
     parser.add_argument("--vx", type=float, default=None, help="Override vx command")
     parser.add_argument("--vy", type=float, default=None, help="Override vy command")
     parser.add_argument("--omega", type=float, default=None, help="Override omega command")
+    parser.add_argument("--omega_rotation", action="store_true", help="If set will randomize a rotation around the yaw axis of either 90 or 180 degs following a Bernoulli distro. \
+                         If you want to bias the distro towards a rotation of 180 set --omega_rotational_distro to a value > 0.5 (i.e 0.7) or viceversa")
+    parser.add_argument("--omega_rotational_distro", type=float, default=None, help="If set will randomize a rotation around the yaw axis of either 90 or 180 degs following a Bernoulli distro. \
+                         If you want to bias the distro towards a rotation of 180 set a value > 0.5 (i.e 0.7)")
 
     AppLauncher.add_app_launcher_args(parser)
     args, _ = parser.parse_known_args()
@@ -114,6 +121,11 @@ def main():
         fixed_cmd = torch.tensor([vx, vy, omega], device=device).unsqueeze(0).expand(args.num_envs, -1)
         print(f"[INFO] Fixed velocity command: vx={vx}, vy={vy}, omega={omega}")
 
+    if args.omega_rotation: 
+        ber_distro = torch.distributions.Bernoulli(torch.tensor(args.omega_rotational_distro))
+        omega_range = []
+
+
     obs = obs_reset
     step_count = 0
     episode_rewards = torch.zeros(args.num_envs, device=device)
@@ -122,8 +134,12 @@ def main():
     total_reward_sum = 0.0
     total_length_sum = 0
 
-    print(f"[INFO] Starting rollout ({'deterministic' if args.deterministic else 'stochastic'})...")
+    print(f"[INFO] Starting rollout ({'deterministic' if args.deterministic else 'random selection' if args.random else 'stochastic'})...")
 
+    random_range = ast.literal_eval(args.random_range) if args.random_range else [0, codebook_size]
+    print(f"[INFO] Random action range: {random_range}", flush=True)
+
+    low, high = random_range
     while True:
         if args.max_steps > 0 and step_count >= args.max_steps:
             break
@@ -148,9 +164,12 @@ def main():
             s_norm = task_block._normalize_s(s)
             hl_out = task_block.high_level(s_norm, g)
             logits = hl_out["logits"]  # (B, num_active, codebook_size)
-
+            
             if args.deterministic:
                 indices = logits.argmax(dim=-1)  # (B, num_active)
+            elif args.random: 
+                indices = torch.randint(low=low, high=high, size=(s.shape[0], num_active), device=device)
+                print(f"[DEBUG] Random indices (first 5): {indices[:5]}")
             else:
                 dist = torch.distributions.Categorical(logits=logits)
                 indices = dist.sample()
@@ -158,8 +177,7 @@ def main():
             # Decode to physical action
             physical_action = a2c_network.indices_to_physical_action(s, indices)
 
-        # Step environment
-        obs, reward, terminated, truncated, extras = env.step(physical_action)
+        obs, reward, terminated, truncated, _ = env.step(physical_action)
 
         episode_rewards += reward
         episode_lengths += 1
@@ -189,8 +207,8 @@ def main():
 
     if completed_episodes > 0:
         print(f"\n[SUMMARY] {completed_episodes} episodes completed in {step_count} steps")
-        print(f"  Average reward:  {total_reward_sum / completed_episodes:.3f}")
-        print(f"  Average length:  {total_length_sum / completed_episodes:.1f}")
+        print(f"Average reward:  {total_reward_sum / completed_episodes:.3f}")
+        print(f"Average length:  {total_length_sum / completed_episodes:.1f}")
     else:
         print(f"\n[INFO] {step_count} steps completed, no episodes finished.")
 

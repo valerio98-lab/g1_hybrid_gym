@@ -134,7 +134,6 @@ class G1HybridGymEnvBase(DirectRLEnv):
 
         self._build_reference_tensors()
 
-        # ---------- debug buffers ----------
         self._dbg_fallen: torch.Tensor | None = None
         self._dbg_ee_term: torch.Tensor | None = None
         self._dbg_maxdist: torch.Tensor | None = None

@@ -24,14 +24,17 @@ dataset_params:
     - "right_wrist_roll_link"
     - "right_wrist_pitch_link"
     - "right_wrist_yaw_link"
-  vx_range: [-4.0, 4.0]
-  vy_range: [-4.0, 4.0]
-  omega_range: [-1.0, 1.0]
+  vx_range: [-0.5, 3.0]
+  vy_range: [-0.8, 0.8]
+  orientation_range: [-180.0, 180.0]
+  max_omega: 0.2
   cmd_resample_seconds: 2.5
   rew_w_in_vel: 1.0
   rew_w_ang_vel: 0.5
-  rew_w_lin_vel_penalty: 2.0
-  rew_w_ang_vel_penalty: 1.0 
+  rew_w_lin_vel_penalty: 5.0
+  rew_w_ang_vel_penalty: 2.0 
+  vx_shrink_factor: 1.5
+  omega_decay_threshold: 3.0
 
 
 
