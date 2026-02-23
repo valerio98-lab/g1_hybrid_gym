@@ -34,11 +34,7 @@ def main():
     # Fixed velocity command (optional, otherwise random resampling)
     parser.add_argument("--vx", type=float, default=None, help="Override vx command")
     parser.add_argument("--vy", type=float, default=None, help="Override vy command")
-    parser.add_argument("--omega", type=float, default=None, help="Override omega command")
-    parser.add_argument("--omega_rotation", action="store_true", help="If set will randomize a rotation around the yaw axis of either 90 or 180 degs following a Bernoulli distro. \
-                         If you want to bias the distro towards a rotation of 180 set --omega_rotational_distro to a value > 0.5 (i.e 0.7) or viceversa")
-    parser.add_argument("--omega_rotational_distro", type=float, default=None, help="If set will randomize a rotation around the yaw axis of either 90 or 180 degs following a Bernoulli distro. \
-                         If you want to bias the distro towards a rotation of 180 set a value > 0.5 (i.e 0.7)")
+    parser.add_argument("--yaw", type=float, default=None, help="Override omega command")
 
     AppLauncher.add_app_launcher_args(parser)
     args, _ = parser.parse_known_args()
@@ -53,6 +49,7 @@ def main():
     from g1_hybrid_gym.tasks.direct.g1_hybrid_gym.rl.wrapper_task_ppo import TaskA2CNetwork
 
     from g1_hybrid_prior.models.task_learning_block import TaskLearningBlock, TaskCritic
+    import math
 
     device = str(args.device if torch.cuda.is_available() else "cpu")
 
@@ -60,7 +57,17 @@ def main():
     env_cfg.scene.num_envs = args.num_envs
     env_cfg.sim.device = device
 
+    has_fixed_cmd = args.vx is not None or args.vy is not None or args.yaw is not None
+    args.yaw = math.radians(args.yaw) if args.yaw is not None else 0.0
+
     env = G1HybridGymEnvTask(cfg=env_cfg, render_mode="human")
+
+    if has_fixed_cmd:
+        env.fixed_orientation = args.yaw
+        env.fixed_vx = args.vx if args.vx is not None else 0.5
+        env.fixed_vy = args.vy if args.vy is not None else 0.0
+        print(f"[INFO] Fixed command: vx={env.fixed_vx}, vy={env.fixed_vy}, yaw={env.fixed_orientation:.3f} rad")
+
 
     obs_reset = env.reset()
     if isinstance(obs_reset, tuple):
@@ -102,9 +109,9 @@ def main():
     missing, unexpected = a2c_network.load_state_dict(a2c_keys, strict=False)
     print(f"[INFO] Loaded a2c_network weights. missing={len(missing)}, unexpected={len(unexpected)}")
     if missing:
-        print(f"  Missing (first 10): {missing[:10]}")
+        print(f"Missing (first 10): {missing[:10]}")
     if unexpected:
-        print(f"  Unexpected (first 10): {unexpected[:10]}")
+        print(f"Unexpected (first 10): {unexpected[:10]}")
 
     a2c_network.eval()
     task_block.eval()
@@ -112,19 +119,6 @@ def main():
     codebook_size = task_block.codebook_size
     num_active = task_block.num_active_codebooks
     print(f"[INFO] codebook_size={codebook_size}, num_active_codebooks={num_active}")
-
-    fixed_cmd = None
-    if args.vx is not None or args.vy is not None or args.omega is not None:
-        vx = args.vx if args.vx is not None else 0.5
-        vy = args.vy if args.vy is not None else 0.0
-        omega = args.omega if args.omega is not None else 0.0
-        fixed_cmd = torch.tensor([vx, vy, omega], device=device).unsqueeze(0).expand(args.num_envs, -1)
-        print(f"[INFO] Fixed velocity command: vx={vx}, vy={vy}, omega={omega}")
-
-    if args.omega_rotation: 
-        ber_distro = torch.distributions.Bernoulli(torch.tensor(args.omega_rotational_distro))
-        omega_range = []
-
 
     obs = obs_reset
     step_count = 0
@@ -140,13 +134,10 @@ def main():
     print(f"[INFO] Random action range: {random_range}", flush=True)
 
     low, high = random_range
+    
     while True:
         if args.max_steps > 0 and step_count >= args.max_steps:
             break
-
-        # Override velocity commands if fixed
-        if fixed_cmd is not None:
-            env.vel_cmd[:] = fixed_cmd
 
         # Get observation
         if isinstance(obs, tuple):

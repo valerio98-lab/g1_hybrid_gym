@@ -20,10 +20,9 @@ from g1_hybrid_prior.helpers import (
     quat_rotate,
     quat_mul,
     get_angle_from_quat,
-    wrap_to_pi
+    wrap_to_pi,
 )
 from isaaclab.envs import DirectRLEnv
-
 
 
 class G1HybridGymEnvTask(G1HybridGymEnvBase):
@@ -48,18 +47,43 @@ class G1HybridGymEnvTask(G1HybridGymEnvBase):
 
         self.vx_range = tuple(params.get("vx_range", [0.0, 1.5]))
         self.vx_low_max, self.vx_high_max = self.vx_range
-        print("[INFO] Using vx_range =", self.vx_range, "for task learning. Adjust in YAML if needed.", flush=True)
+        print(
+            "[INFO] Using vx_range =",
+            self.vx_range,
+            "for task learning. Adjust in YAML if needed.",
+            flush=True,
+        )
         self.vy_range = tuple(params.get("vy_range", [-0.3, 0.3]))
         self.vy_low_max, self.vy_high_max = self.vy_range
-        print("[INFO] Using vy_range =", self.vy_range, "for task learning. Adjust in YAML if needed.", flush=True)
+        print(
+            "[INFO] Using vy_range =",
+            self.vy_range,
+            "for task learning. Adjust in YAML if needed.",
+            flush=True,
+        )
         self.orientation_range = tuple(params.get("orientation_range", [-90, 90]))
-        print("[INFO] Using orientation_range =", self.orientation_range, "for task learning. Adjust in YAML if needed.", flush=True)
+        print(
+            "[INFO] Using orientation_range =",
+            self.orientation_range,
+            "for task learning. Adjust in YAML if needed.",
+            flush=True,
+        )
         self.vx_shrink_factor = float(params.get("vx_shrink_factor", 1.5))
         self.max_omega = float(params.get("max_omega", 0.5))
-        print("[INFO] Using max_omega =", self.max_omega, "for task learning. Adjust in YAML if needed.", flush=True)
-        
+        print(
+            "[INFO] Using max_omega =",
+            self.max_omega,
+            "for task learning. Adjust in YAML if needed.",
+            flush=True,
+        )
+
         self.kp_yaw = float(params.get("kp_yaw", 0.5))
-        print("[INFO] Using kp_yaw =", self.kp_yaw, "for task learning. Adjust in YAML if needed.", flush=True)
+        print(
+            "[INFO] Using kp_yaw =",
+            self.kp_yaw,
+            "for task learning. Adjust in YAML if needed.",
+            flush=True,
+        )
         # Command resampling interval (seconds)
         self.cmd_resample_seconds = float(params.get("cmd_resample_seconds", 2.5))
         self.cmd_resample_steps = int(
@@ -73,7 +97,9 @@ class G1HybridGymEnvTask(G1HybridGymEnvBase):
         self.rew_w_ang_vel_penalty = float(params.get("rew_w_ang_vel_penalty", 1.0))
 
         self.vel_cmd = torch.zeros(self.num_envs, 2, device=self.device)
-        self.cmd_timer = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.cmd_timer = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
 
         J = len(self.dataset.robot_cfg.joint_order)
         self.s_dim = 1 + 4 + 3 + 3 + J + J  # 69 for G1
@@ -93,22 +119,35 @@ class G1HybridGymEnvTask(G1HybridGymEnvBase):
     def _resample_commands(self, env_ids: torch.Tensor):
         n = len(env_ids)
 
-        vx = torch.empty(n, device=self.device).uniform_(self.vx_range[0], self.vx_range[1])
-        
-        limit_x_curr = torch.where(vx >= 0, 
-                                torch.tensor(self.vx_range[1], device=self.device), 
-                                torch.tensor(abs(self.vx_range[0]), device=self.device))
+        vx = torch.empty(n, device=self.device).uniform_(
+            self.vx_range[0], self.vx_range[1]
+        )
+
+        limit_x_curr = torch.where(
+            vx >= 0,
+            torch.tensor(self.vx_range[1], device=self.device),
+            torch.tensor(abs(self.vx_range[0]), device=self.device),
+        )
 
         ratio_x_sq = (vx.abs() / limit_x_curr).pow(2)
         ratio_x_sq = torch.clamp(ratio_x_sq, 0.0, 1.0)
 
         max_vy_dynamic = self.vy_range[1] * torch.sqrt(1.0 - ratio_x_sq)
         vy = (torch.rand(n, device=self.device) * 2 - 1) * max_vy_dynamic
-            
-        sampled_orientation = torch.empty(n, device=self.device).uniform_(self.orientation_range[0], self.orientation_range[1])
+
+        sampled_orientation = torch.empty(n, device=self.device).uniform_(
+            self.orientation_range[0], self.orientation_range[1]
+        )
         current_orientation_quat = self.robot.data.root_com_quat_w[env_ids]
         _, _, current_yaw = get_angle_from_quat(current_orientation_quat)
         
+        if hasattr(self, 'fixed_vx') and self.fixed_vx is not None:
+            vx = torch.full((n,), self.fixed_vx, device=self.device)
+            vy = torch.full((n,), self.fixed_vy, device=self.device)
+
+        if hasattr(self, 'fixed_orientation') and self.fixed_orientation is not None:
+            sampled_orientation = torch.full((n,), self.fixed_orientation, device=self.device)
+
         self.yaw_target[env_ids] = current_yaw + sampled_orientation
         self.vel_cmd[env_ids, 0] = vx
         self.vel_cmd[env_ids, 1] = vy
@@ -136,16 +175,25 @@ class G1HybridGymEnvTask(G1HybridGymEnvBase):
         joint_vel = self.robot.data.joint_vel[:, self.dataset_to_isaac_indexes]
 
         s_cur = torch.cat(
-            (h, root_quat_wxyz, root_lin_vel_body, root_ang_vel_body, joint_pos, joint_vel),
+            (
+                h,
+                root_quat_wxyz,
+                root_lin_vel_body,
+                root_ang_vel_body,
+                joint_pos,
+                joint_vel,
+            ),
             dim=-1,
         )
 
         _, _, current_yaw = get_angle_from_quat(root_quat_wxyz)
-        yaw_error = wrap_to_pi(self.yaw_target - current_yaw)  
-        omega_cmd = torch.clamp(self.kp_yaw * yaw_error, -self.max_omega, self.max_omega)
-        vx_cmd = self.vel_cmd[:,0]
-        vy_cmd = self.vel_cmd[:,1]
-        g_task = torch.stack([vx_cmd, vy_cmd, omega_cmd], dim=-1) 
+        yaw_error = wrap_to_pi(self.yaw_target - current_yaw)
+        omega_cmd = torch.clamp(
+            self.kp_yaw * yaw_error, -self.max_omega, self.max_omega
+        )
+        vx_cmd = self.vel_cmd[:, 0]
+        vy_cmd = self.vel_cmd[:, 1]
+        g_task = torch.stack([vx_cmd, vy_cmd, omega_cmd], dim=-1)
         obs = torch.cat((s_cur, g_task), dim=-1)
 
         # Cache for reward computation
@@ -167,7 +215,11 @@ class G1HybridGymEnvTask(G1HybridGymEnvBase):
         vx_cur, vy_cur = v_body[:, 0], v_body[:, 1]
         wz_cur = w_body[:, 2]
 
-        vx_cmd, vy_cmd, omega_cmd = self.vel_cmd[:, 0], self.vel_cmd[:, 1], self._cached_omega_cmd
+        vx_cmd, vy_cmd, omega_cmd = (
+            self.vel_cmd[:, 0],
+            self.vel_cmd[:, 1],
+            self._cached_omega_cmd,
+        )
 
         lin_vel_err = (vx_cur - vx_cmd) ** 2 + (vy_cur - vy_cmd) ** 2
         r_lin = torch.exp(-self.rew_w_lin_vel_penalty * lin_vel_err)
@@ -208,7 +260,6 @@ class G1HybridGymEnvTask(G1HybridGymEnvBase):
 
         return terminated, time_out
 
-
     def _reset_idx(self, env_ids):
         if env_ids is None:
             env_ids = self.robot._ALL_INDICES
@@ -231,7 +282,7 @@ class G1HybridGymEnvTask(G1HybridGymEnvBase):
         joints_0 = self._ref_joints[random_starts]
         joint_vel_0 = self._ref_joint_vel[random_starts]
 
-        # Heading Randomization 
+        # Heading Randomization
         rand_yaw = (torch.rand(n, device=self.device) * 2.0 - 1.0) * torch.pi
         cy = torch.cos(rand_yaw * 0.5)
         sy = torch.sin(rand_yaw * 0.5)
@@ -267,7 +318,9 @@ class G1HybridGymEnvTask(G1HybridGymEnvBase):
 
         self.robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self.robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
-        self.robot.write_joint_state_to_sim(default_joint_pos, default_joint_vel, None, env_ids)
+        self.robot.write_joint_state_to_sim(
+            default_joint_pos, default_joint_vel, None, env_ids
+        )
 
         self._resample_commands(env_ids)
         self._cached_ref_tensors = None
