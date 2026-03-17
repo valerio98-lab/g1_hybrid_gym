@@ -76,8 +76,6 @@ class G1HybridGymEnvImitation(G1HybridGymEnvBase):
             self._ref_body_pos = torch.stack([f["body_pos"] for f in frames], dim=0).to(
                 self.device
             )
-
-        # (opzionale in futuro) se un domani esporti body_rot:
         if frames and ("body_rot" in frames[0]):
             self._ref_body_rot = torch.stack([f["body_rot"] for f in frames], dim=0).to(
                 self.device

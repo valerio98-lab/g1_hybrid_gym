@@ -1,6 +1,6 @@
 dataset_params: 
-  training_type: "imitation_learning" # "ppo_amp", "ppo", "imitation_learning"
-  dataset_path: "/home/valerio/g1_hybrid_prior/data_raw/LAFAN1_Retargeting_Dataset/g1_body_fk_npz_partial"
+  training_type: "ppo" # "ppo_amp", "ppo", "learning" (learning include sia imitation che task)
+  dataset_path: "/home/valerio/g1_hybrid_prior/data_raw/LAFAN1_Retargeting_Dataset/g1_body_npz_partial_locomani"
   robot: "g1" # "g1" or "g1_amp"
   dataset_type: "augmented" # "raw" or "augmented"
   lazy_load: False
@@ -9,7 +9,7 @@ dataset_params:
   max_rot_reset: False
   early_termination_dist_threshold: 0.5
   early_term_rot_threshold_deg: 90.0
-  upper_names:
+  upper_names: #Veniva usato dalla pipeline con AMP, probabilmente da eliminare, per ora inutilizzato dalla pipeline. 
     - "left_shoulder_pitch_link"
     - "left_shoulder_roll_link"
     - "left_shoulder_yaw_link"
@@ -29,10 +29,10 @@ dataset_params:
   orientation_range: [-180.0, 180.0]
   max_omega: 0.2
   cmd_resample_seconds: 2.5
-  rew_w_in_vel: 1.0
-  rew_w_ang_vel: 0.5
-  rew_w_lin_vel_penalty: 5.0
-  rew_w_ang_vel_penalty: 2.0 
+  rew_w_in_vel: 0.66
+  rew_w_ang_vel: 0.33
+  rew_w_lin_vel_penalty: 3.0
+  rew_w_ang_vel_penalty: 6.0 
   vx_shrink_factor: 1.5
   omega_decay_threshold: 3.0
 

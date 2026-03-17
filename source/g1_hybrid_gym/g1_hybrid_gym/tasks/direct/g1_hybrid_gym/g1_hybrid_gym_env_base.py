@@ -74,6 +74,22 @@ class G1HybridGymEnvBase(DirectRLEnv):
                 torch.as_tensor(joint_idx, dtype=torch.long).reshape(-1).to(self.device)
             )
             g1_dof_idx.append(int(joint_idx_t.item()))
+        
+        self.body_names_dataset = self.dataset.get_body_names()
+        self.body_isaac_indices = None
+        if self.body_names_dataset:
+            all_body_names = self.robot.body_names
+            body_isaac_indices = []
+            for name in self.body_names_dataset:
+                if name not in all_body_names:
+                    raise ValueError(
+                        f"[{self.__class__.__name__}] Body '{name}' not found in Isaac articulation!"
+                    )
+                body_isaac_indices.append(all_body_names.index(name))
+            self.body_isaac_indices = torch.tensor(
+                body_isaac_indices, device=self.device, dtype=torch.long
+            )
+            print(f"[{self.__class__.__name__}] Mapped {len(body_isaac_indices)} body frames.")
 
         self.dataset_to_isaac_indexes = torch.tensor(
             dataset_to_isaac_indexes, device=self.device, dtype=torch.long
@@ -130,7 +146,9 @@ class G1HybridGymEnvBase(DirectRLEnv):
         self._ref_joint_vel: torch.Tensor | None = None
         self._ref_ee_pos: torch.Tensor | None = None  # optional (PPO)
         self._ref_body_pos: torch.Tensor | None = None  # optional (AMP early term)
-        self._ref_body_rot: torch.Tensor | None = None
+        self._ref_body_quat: torch.Tensor | None = None
+        self._ref_body_lin_vel: torch.Tensor | None = None
+        self._ref_body_ang_vel: torch.Tensor | None = None
 
         self._build_reference_tensors()
 
@@ -184,6 +202,17 @@ class G1HybridGymEnvBase(DirectRLEnv):
             self._ref_ee_pos = torch.stack([f["ee_pos"] for f in frames], dim=0).to(
                 self.device
             )
+        if "body_pos" in frames[0]: 
+            self._ref_body_pos = torch.stack([f["body_pos"] for f in frames], dim=0).to(self.device)
+
+        if "body_quat" in frames[0]:
+            self._ref_body_quat = torch.stack([f["body_quat"] for f in frames], dim=0).to(self.device)
+        
+        if "body_lin_vel" in frames[0]:
+            self._ref_body_lin_vel = torch.stack([f["body_lin_vel"] for f in frames], dim=0).to(self.device)
+        
+        if "body_ang_vel" in frames[0]:
+            self._ref_body_ang_vel = torch.stack([f["body_ang_vel"] for f in frames], dim=0).to(self.device)
 
     def _get_ref_batch(self, frame_idx: torch.Tensor) -> dict[str, torch.Tensor]:
         idx = frame_idx.clamp(0, self.max_frame_idx)
@@ -199,8 +228,12 @@ class G1HybridGymEnvBase(DirectRLEnv):
             batch["ee_pos"] = self._ref_ee_pos.index_select(0, idx)
         if self._ref_body_pos is not None:
             batch["body_pos"] = self._ref_body_pos.index_select(0, idx)
-        if self._ref_body_rot is not None:
-            batch["body_rot"] = self._ref_body_rot.index_select(0, idx)
+        if self._ref_body_quat is not None:
+            batch["body_quat"] = self._ref_body_quat.index_select(0, idx)
+        if self._ref_body_lin_vel is not None:
+            batch["body_lin_vel"] = self._ref_body_lin_vel.index_select(0, idx)
+        if self._ref_body_ang_vel is not None:
+            batch["body_ang_vel"] = self._ref_body_ang_vel.index_select(0, idx)
 
         return batch
 
@@ -269,31 +302,59 @@ class G1HybridGymEnvBase(DirectRLEnv):
         joint_pos: torch.Tensor,
         joint_vel: torch.Tensor,
         ref: Dict[str, torch.Tensor],
+        body_state_w: torch.Tensor | None = None,
+        env_origins: torch.Tensor | None = None,
     ) -> torch.Tensor:
+
         h_ref = ref["root_pos"][:, 2:3]
         dh = h_ref - h_cur
 
         q_ref = quat_normalize(ref["root_quat_wxyz"])
         q_cur = quat_normalize(q_cur_wxyz)
-        q_err = quat_mul(q_ref, quat_inv(q_cur))
-        q_err = quat_normalize(q_err)
+        q_err = quat_normalize(quat_mul(q_ref, quat_inv(q_cur)))
 
-        v_ref_body_ref = ref["root_lin_vel"]
-        w_ref_body_ref = ref["root_ang_vel"]
-
-        v_ref_world = quat_rotate(q_ref, v_ref_body_ref)
-        w_ref_world = quat_rotate(q_ref, w_ref_body_ref)
-
-        v_ref_body_sim = quat_rotate_inv(q_cur, v_ref_world)
-        w_ref_body_sim = quat_rotate_inv(q_cur, w_ref_world)
-
-        dv = v_ref_body_sim - v_cur_body
-        dw = w_ref_body_sim - w_cur_body
+        v_ref_world = quat_rotate(q_ref, ref["root_lin_vel"])
+        w_ref_world = quat_rotate(q_ref, ref["root_ang_vel"])
+        dv = quat_rotate_inv(q_cur, v_ref_world) - v_cur_body
+        dw = quat_rotate_inv(q_cur, w_ref_world) - w_cur_body
 
         dq = wrap_to_pi(ref["joints"] - joint_pos)
         dqd = ref["joint_vel"] - joint_vel
 
-        return torch.cat((dh, q_err, dv, dw, dq, dqd), dim=-1)
+        goal = torch.cat((dh, q_err, dv, dw, dq, dqd), dim=-1)
+
+        has_body_ref = (
+            ref.get("body_pos") is not None
+            and ref.get("body_quat") is not None
+            and ref.get("body_lin_vel") is not None
+            and ref.get("body_ang_vel") is not None
+        )
+
+        if has_body_ref and body_state_w is not None and self.body_isaac_indices is not None:
+            N = body_state_w.shape[0]
+
+            sim_bp = body_state_w[:, self.body_isaac_indices, 0:3]  # (N, K, 3)
+            sim_bq = quat_normalize(body_state_w[:, self.body_isaac_indices, 3:7])  # (N, K, 4)
+            sim_bv = body_state_w[:, self.body_isaac_indices, 7:10]   # (N, K, 3)
+            sim_bw = body_state_w[:, self.body_isaac_indices, 10:13]  # (N, K, 3)
+
+            if env_origins is not None:
+                sim_bp = sim_bp - env_origins.unsqueeze(1)
+
+            ref_bp = ref["body_pos"]    # (N, K, 3)
+            ref_bq = ref["body_quat"]   # (N, K, 4) wxyz
+            ref_bv = ref["body_lin_vel"] # (N, K, 3)
+            ref_bw = ref["body_ang_vel"] # (N, K, 3)
+
+            dp = (ref_bp - sim_bp).reshape(N, -1)                                    # (N, K*3)
+            dq_b = quat_normalize(quat_mul(ref_bq, quat_inv(sim_bq))).reshape(N, -1) # (N, K*4)
+            dv_b = (ref_bv - sim_bv).reshape(N, -1)                                  # (N, K*3)
+            dw_b = (ref_bw - sim_bw).reshape(N, -1)                                  # (N, K*3)
+
+            body_goal = torch.cat((dp, dq_b, dv_b, dw_b), dim=-1)
+            goal = torch.cat((goal, body_goal), dim=-1)
+
+        return goal
 
     def step(self, action):
         """
@@ -385,6 +446,10 @@ class G1HybridGymEnvBase(DirectRLEnv):
         self.ref_frame_idx.clamp_(0, self.max_frame_idx)
         ref = self._get_ref_batch(self.ref_frame_idx)
 
+        body_state_w = None
+        if self.body_isaac_indices is not None:
+            body_state_w = self.robot.data.body_state_w  # (N, num_bodies, 13)
+
         goal = self._build_goal_from_ref(
             h_cur=h,
             q_cur_wxyz=root_quat_wxyz,
@@ -393,6 +458,8 @@ class G1HybridGymEnvBase(DirectRLEnv):
             joint_pos=joint_pos,
             joint_vel=joint_vel,
             ref=ref,
+            body_state_w=body_state_w,
+            env_origins=self.scene.env_origins,
         )
 
         obs = torch.cat((s_cur, goal), dim=-1)
@@ -477,7 +544,6 @@ class G1HybridGymEnvBase(DirectRLEnv):
         root_pos_w = root_link_state[:, 0:3] - self.scene.env_origins
         root_quat_w = quat_normalize(root_link_state[:, 3:7])
 
-        # EE (optional)
         ee_pos_rel = None
         if self.ee_isaac_indices is not None:
             ee_state_w = self.robot.data.body_state_w[:, self.ee_isaac_indices, 0:3]

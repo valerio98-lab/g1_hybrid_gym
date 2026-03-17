@@ -15,22 +15,22 @@ class ExpertPolicyWrapper(ModelA2CContinuousLogStd):
             )
 
         full_obs_dim = obs_shape[0]
-        if (full_obs_dim) % 2 != 0:
-            raise RuntimeError(
-                f"[ExpertPolicyWrapper] Expected obs = [s_cur, s_ref] s_cur(69) + s_ref(69) = 138, "
-                f"but got dim={full_obs_dim}"
-            )
+        # if (full_obs_dim) % 2 != 0:
+        #     raise RuntimeError(
+        #         f"[ExpertPolicyWrapper] Expected obs = [s_cur, s_ref] s_cur(69) + s_ref(69) = 138, "
+        #         f"but got dim={full_obs_dim}"
+        #     )
 
-        state_dim = (full_obs_dim) // 2
-        obs_dim = state_dim  # [q, qdot]
-        goal_dim = state_dim  # [q_ref - q, qdot_ref - qdot]
+        #state_dim = (full_obs_dim) // 2
+        obs_dim = 69  # [q, qdot]
+        goal_dim = full_obs_dim - obs_dim  # [q_ref - q, qdot_ref - qdot]
         action_dim = config["actions_num"]
         device = config.get("device", "cuda:0")
 
         print(
             f"[ExpertPolicyWrapper] obs_dim={obs_dim}, goal_dim={goal_dim}, action_dim={action_dim}"
         )
-        print(f"[ExpertPolicyWrapper] CONFIG KEYS: {config.keys()}")
+        print(f"[ExpertPolicyWrapper] CONFIG KEYS: {config.keys()}", flush=True)
 
         expert_policy = ExpertPolicy(
             obs_dim=obs_dim,
@@ -55,13 +55,14 @@ class ExpertPolicyWrapper(ModelA2CContinuousLogStd):
         def __init__(self, a2c_network, **kwargs):
             super().__init__(a2c_network, **kwargs)
             full_dim = self.obs_shape[0]
+            self.obs_dim = 69
 
-            if full_dim % 2 != 0:
-                raise RuntimeError(
-                    f"[ExpertPolicyWrapper.Network] obs dim={full_dim} is not even; "
-                    f"expected [s_cur, s_ref]"
-                )
-            self.state_dim = full_dim // 2  # dim di s_cur (e s_ref)
+            # if full_dim % 2 != 0:
+            #     raise RuntimeError(
+            #         f"[ExpertPolicyWrapper.Network] obs dim={full_dim} is not even; "
+            #         f"expected [s_cur, s_ref]"
+            #     )
+            # self.state_dim = full_dim // 2  # dim di s_cur (e s_ref)
 
         def forward(self, input_dict):
             is_train = input_dict.get("is_train", True)
@@ -69,10 +70,9 @@ class ExpertPolicyWrapper(ModelA2CContinuousLogStd):
 
             # obs_full = [s_cur, s_ref]
             obs_full = self.norm_obs(input_dict["obs"])
-            state_dim = self.state_dim
 
-            obs = obs_full[..., :state_dim]  # s_cur
-            goal = obs_full[..., state_dim:]  # s_ref
+            obs = obs_full[..., :self.obs_dim]  # s_cur
+            goal = obs_full[..., self.obs_dim:]  # s_ref
 
             mu, log_std, value = self.a2c_network(obs, goal)
             sigma = torch.exp(log_std)
