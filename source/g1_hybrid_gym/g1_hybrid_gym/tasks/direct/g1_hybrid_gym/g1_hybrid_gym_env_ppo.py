@@ -16,6 +16,7 @@ class G1HybridGymEnvPPO(G1HybridGymEnvBase):
 
     def _get_dones(self):
         terminated, time_out = super()._get_dones()
+        self._bgd += 1
 
         ref = self._cached_ref_tensors
         if ref is None:
@@ -23,15 +24,23 @@ class G1HybridGymEnvPPO(G1HybridGymEnvBase):
             ref = self._get_ref_batch(self.ref_frame_idx)
             self._cached_ref_tensors = ref
 
-        if ref.get("ee_pos") is not None and self.ee_isaac_indices is not None:
-            ee_state_w = self.robot.data.body_state_w[:, self.ee_isaac_indices, 0:3]
-            ee_pos_rel = ee_state_w - self.scene.env_origins.unsqueeze(1)
-            max_dist = (
-                torch.linalg.norm(ee_pos_rel - ref["ee_pos"], dim=-1).max(dim=-1).values
-            )
-            ee_term = max_dist > 0.5
-            terminated = terminated | ee_term
-            self._dbg_ee_term = ee_term
+        if ref.get("body_pos") is not None and self.body_isaac_indices is not None:
+            root_pos_w = self.robot.data.root_link_state_w[:, :3]
+            body_state_w = self.robot.data.body_state_w[:, self.body_isaac_indices, 0:3]
+            sim_pos_rel = body_state_w - root_pos_w.unsqueeze(1)  # relativo al root
+
+            # ref["body_pos"] è già relativo al root → confronto diretto
+            max_dist = torch.linalg.norm(sim_pos_rel - ref["body_pos"], dim=-1).max(dim=-1).values
+            # max_dist_b = (
+            #     torch.linalg.norm(ee_pos_rel[:, 4:, :] - ref["body_pos"][:, torch.tensor([6,7]), :], dim=-1).max(dim=-1).values
+            # )
+            # if self._bgd % 100 == 0:
+            #     res = max_dist[:]
+            #     print(f"Error values related to hands: {res}", flush=True)
+            #     print(f"Error values in max_dist_b {max_dist_b}", flush=True)
+            body_term = max_dist > 0.2
+            terminated = terminated | body_term
+            self._dbg_ee_term = body_term
             self._dbg_maxdist = max_dist
 
         return terminated, time_out

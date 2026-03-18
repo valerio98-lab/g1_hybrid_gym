@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import torch
+import einops
 import yaml
 from typing import Dict, Optional
 from collections.abc import Sequence
@@ -51,6 +52,7 @@ class G1HybridGymEnvBase(DirectRLEnv):
 
         self.dataset = self._load_dataset()
         self.max_frame_idx = len(self.dataset) - 1
+        self._bgd = 0
         print(
             f"[{self.__class__.__name__}] Loaded dataset with {len(self.dataset)} frames"
         )
@@ -89,7 +91,7 @@ class G1HybridGymEnvBase(DirectRLEnv):
             self.body_isaac_indices = torch.tensor(
                 body_isaac_indices, device=self.device, dtype=torch.long
             )
-            print(f"[{self.__class__.__name__}] Mapped {len(body_isaac_indices)} body frames.")
+            print(f"[{self.__class__.__name__}] Mapped Body Names: {self.body_names_dataset} -> {self.body_isaac_indices.tolist()}")
 
         self.dataset_to_isaac_indexes = torch.tensor(
             dataset_to_isaac_indexes, device=self.device, dtype=torch.long
@@ -202,6 +204,8 @@ class G1HybridGymEnvBase(DirectRLEnv):
             self._ref_ee_pos = torch.stack([f["ee_pos"] for f in frames], dim=0).to(
                 self.device
             )
+            # print(f"Dimensione di _ee_pos during frame building: {self._ref_ee_pos.shape}", flush=True)
+
         if "body_pos" in frames[0]: 
             self._ref_body_pos = torch.stack([f["body_pos"] for f in frames], dim=0).to(self.device)
 
@@ -306,22 +310,22 @@ class G1HybridGymEnvBase(DirectRLEnv):
         env_origins: torch.Tensor | None = None,
     ) -> torch.Tensor:
 
-        h_ref = ref["root_pos"][:, 2:3]
-        dh = h_ref - h_cur
+        # h_ref = ref["root_pos"][:, 2:3]
+        # dh = h_ref - h_cur
 
-        q_ref = quat_normalize(ref["root_quat_wxyz"])
-        q_cur = quat_normalize(q_cur_wxyz)
-        q_err = quat_normalize(quat_mul(q_ref, quat_inv(q_cur)))
+        # q_ref = quat_normalize(ref["root_quat_wxyz"])
+        # q_cur = quat_normalize(q_cur_wxyz)
+        # q_err = quat_normalize(quat_mul(q_ref, quat_inv(q_cur)))
 
-        v_ref_world = quat_rotate(q_ref, ref["root_lin_vel"])
-        w_ref_world = quat_rotate(q_ref, ref["root_ang_vel"])
-        dv = quat_rotate_inv(q_cur, v_ref_world) - v_cur_body
-        dw = quat_rotate_inv(q_cur, w_ref_world) - w_cur_body
+        # v_ref_world = quat_rotate(q_ref, ref["root_lin_vel"])
+        # w_ref_world = quat_rotate(q_ref, ref["root_ang_vel"])
+        # dv = quat_rotate_inv(q_cur, v_ref_world) - v_cur_body
+        # dw = quat_rotate_inv(q_cur, w_ref_world) - w_cur_body
 
-        dq = wrap_to_pi(ref["joints"] - joint_pos)
-        dqd = ref["joint_vel"] - joint_vel
+        # dq = wrap_to_pi(ref["joints"] - joint_pos)
+        # dqd = ref["joint_vel"] - joint_vel
 
-        goal = torch.cat((dh, q_err, dv, dw, dq, dqd), dim=-1)
+        # goal = torch.cat((dh, q_err, dv, dw, dq, dqd), dim=-1) 
 
         has_body_ref = (
             ref.get("body_pos") is not None
@@ -338,8 +342,8 @@ class G1HybridGymEnvBase(DirectRLEnv):
             sim_bv = body_state_w[:, self.body_isaac_indices, 7:10]   # (N, K, 3)
             sim_bw = body_state_w[:, self.body_isaac_indices, 10:13]  # (N, K, 3)
 
-            if env_origins is not None:
-                sim_bp = sim_bp - env_origins.unsqueeze(1)
+            root_pos_w = self.robot.data.root_link_state_w[:, :3]  # (N, 3)
+            sim_bp = sim_bp - root_pos_w.unsqueeze(1)  # (N, K, 3)
 
             ref_bp = ref["body_pos"]    # (N, K, 3)
             ref_bq = ref["body_quat"]   # (N, K, 4) wxyz
@@ -351,8 +355,8 @@ class G1HybridGymEnvBase(DirectRLEnv):
             dv_b = (ref_bv - sim_bv).reshape(N, -1)                                  # (N, K*3)
             dw_b = (ref_bw - sim_bw).reshape(N, -1)                                  # (N, K*3)
 
-            body_goal = torch.cat((dp, dq_b, dv_b, dw_b), dim=-1)
-            goal = torch.cat((goal, body_goal), dim=-1)
+            body_goal = torch.cat((dp, dq_b, dv_b, dw_b), dim=-1) #K=14 -> K*3 + K*4 + K*3 + K*3 = 182
+            goal = body_goal
 
         return goal
 
@@ -431,6 +435,13 @@ class G1HybridGymEnvBase(DirectRLEnv):
         joint_pos = self.robot.data.joint_pos[:, self.dataset_to_isaac_indexes]
         joint_vel = self.robot.data.joint_vel[:, self.dataset_to_isaac_indexes]
 
+        ee_pos_w = self.robot.data.body_state_w[:, self.ee_isaac_indices, :3]
+        ee_pos_w = ee_pos_w - root_pos_w.unsqueeze(1)
+
+        q_exp = einops.repeat(root_quat_wxyz, 'N dim -> N K dim', K=self.ee_isaac_indices.shape[0])
+        ee_pos_b = quat_rotate_inv(q_exp, ee_pos_w)
+        ee_pos_b = ee_pos_b.reshape(ee_pos_b.shape[0], -1)
+
         s_cur = torch.cat(
             (
                 h,
@@ -439,8 +450,9 @@ class G1HybridGymEnvBase(DirectRLEnv):
                 root_ang_vel_body,
                 joint_pos,
                 joint_vel,
+                ee_pos_b
             ),
-            dim=-1,
+            dim=-1, # 1 + 4 + 3 + 3 + 29 + 29 + (3*4) = 81
         )
 
         self.ref_frame_idx.clamp_(0, self.max_frame_idx)
@@ -462,7 +474,7 @@ class G1HybridGymEnvBase(DirectRLEnv):
             env_origins=self.scene.env_origins,
         )
 
-        obs = torch.cat((s_cur, goal), dim=-1)
+        obs = torch.cat((s_cur, goal), dim=-1) #81 + 182 = 263
 
         return {"policy": obs}
 
@@ -547,7 +559,8 @@ class G1HybridGymEnvBase(DirectRLEnv):
         ee_pos_rel = None
         if self.ee_isaac_indices is not None:
             ee_state_w = self.robot.data.body_state_w[:, self.ee_isaac_indices, 0:3]
-            ee_pos_rel = ee_state_w - self.scene.env_origins.unsqueeze(1)
+            root_pos_w_3d = root_link_state[:, 0:3]  
+            ee_pos_rel = ee_state_w - root_pos_w_3d.unsqueeze(1)
 
         # ref
         if self._cached_ref_tensors is not None:

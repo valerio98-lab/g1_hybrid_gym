@@ -2,7 +2,7 @@ import torch
 from rl_games.algos_torch.models import ModelA2CContinuousLogStd
 from g1_hybrid_prior.models.expert_policy import ExpertPolicy
 
-
+OBS_DIM = 81
 class ExpertPolicyWrapper(ModelA2CContinuousLogStd):
     def __init__(self, network):
         super().__init__(network)
@@ -22,7 +22,7 @@ class ExpertPolicyWrapper(ModelA2CContinuousLogStd):
         #     )
 
         #state_dim = (full_obs_dim) // 2
-        obs_dim = 69  # [q, qdot]
+        obs_dim = OBS_DIM  # [q, qdot]
         goal_dim = full_obs_dim - obs_dim  # [q_ref - q, qdot_ref - qdot]
         action_dim = config["actions_num"]
         device = config.get("device", "cuda:0")
@@ -55,7 +55,7 @@ class ExpertPolicyWrapper(ModelA2CContinuousLogStd):
         def __init__(self, a2c_network, **kwargs):
             super().__init__(a2c_network, **kwargs)
             full_dim = self.obs_shape[0]
-            self.obs_dim = 69
+            self.obs_dim = OBS_DIM
 
             # if full_dim % 2 != 0:
             #     raise RuntimeError(
