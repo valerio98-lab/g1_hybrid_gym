@@ -1,6 +1,9 @@
 import torch
+import einops
 
 from .g1_hybrid_gym_env_base import G1HybridGymEnvBase
+
+from g1_hybrid_prior.helpers import quat_normalize, quat_rotate_inv
 
 
 class G1HybridGymEnvPPO(G1HybridGymEnvBase):
@@ -25,20 +28,26 @@ class G1HybridGymEnvPPO(G1HybridGymEnvBase):
             self._cached_ref_tensors = ref
 
         if ref.get("body_pos") is not None and self.body_isaac_indices is not None:
+            N = self.robot.data.root_link_state_w.shape[0]
+            K = self.body_isaac_indices.shape[0]
+            
             root_pos_w = self.robot.data.root_link_state_w[:, :3]
+            sim_quat_w = quat_normalize(self.robot.data.root_link_state_w[:, 3:7])
             body_state_w = self.robot.data.body_state_w[:, self.body_isaac_indices, 0:3]
-            sim_pos_rel = body_state_w - root_pos_w.unsqueeze(1)  # relativo al root
+            
+            sim_pos_rel_w = body_state_w - root_pos_w.unsqueeze(1) # Differenza in World
+            sim_q_exp = einops.repeat(sim_quat_w, 'N dim -> N K dim', K=K)
+            sim_pos_local = quat_rotate_inv(sim_q_exp, sim_pos_rel_w)
 
-            # ref["body_pos"] è già relativo al root → confronto diretto
-            max_dist = torch.linalg.norm(sim_pos_rel - ref["body_pos"], dim=-1).max(dim=-1).values
-            # max_dist_b = (
-            #     torch.linalg.norm(ee_pos_rel[:, 4:, :] - ref["body_pos"][:, torch.tensor([6,7]), :], dim=-1).max(dim=-1).values
-            # )
-            # if self._bgd % 100 == 0:
-            #     res = max_dist[:]
-            #     print(f"Error values related to hands: {res}", flush=True)
-            #     print(f"Error values in max_dist_b {max_dist_b}", flush=True)
-            body_term = max_dist > 0.2
+            ref_pos_rel_w = ref["body_pos"]
+            ref_quat_w = quat_normalize(ref["root_quat_wxyz"])
+            
+            ref_q_exp = einops.repeat(ref_quat_w, 'N dim -> N K dim', K=K)
+            ref_pos_local = quat_rotate_inv(ref_q_exp, ref_pos_rel_w)
+
+            max_dist = torch.linalg.norm(sim_pos_local - ref_pos_local, dim=-1).max(dim=-1).values
+            
+            body_term = max_dist > 0.3
             terminated = terminated | body_term
             self._dbg_ee_term = body_term
             self._dbg_maxdist = max_dist

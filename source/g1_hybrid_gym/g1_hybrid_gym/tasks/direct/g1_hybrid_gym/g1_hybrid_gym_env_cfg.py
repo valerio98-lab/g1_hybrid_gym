@@ -19,7 +19,7 @@ class G1HybridGymEnvCfg(DirectRLEnvCfg):
     episode_length_s = 5.0
     # - spaces definition
     action_space = 29
-    observation_space = 263 #268(4EE + body_names state ma con stato ibrido) #138 (old_pipeline)
+    observation_space = 332 #263 #268(4EE + body_names state ma con stato ibrido) #138 (old_pipeline)
     state_space = 0
 
     # simulation
