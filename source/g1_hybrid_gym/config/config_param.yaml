@@ -1,5 +1,5 @@
 dataset_params: 
-  training_type: "imitation_learning" # "ppo_amp", "ppo", "imitation_learning"
+  training_type: "ppo" # "ppo_amp", "ppo", "imitation_learning"
   dataset_path: "/home/valerio/g1_hybrid_prior/data_raw/LAFAN1_Retargeting_Dataset/g1_body_fk_npz_partial"
   robot: "g1" # "g1" or "g1_amp"
   dataset_type: "augmented" # "raw" or "augmented"

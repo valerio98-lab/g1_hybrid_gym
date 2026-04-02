@@ -187,6 +187,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     runner.load(agent_cfg)
     # obtain the agent from the runner
     agent: BasePlayer = runner.create_player()
+    fixed_path = resume_path.replace(".pth", "_fixed.pth")
+
+    if not os.path.exists(fixed_path):
+        ckpt = torch.load(resume_path, map_location="cpu", weights_only=False)
+        sd = ckpt.get("model", ckpt)
+        key_map = {
+            "running_mean_std.running_mean": "a2c_network.obs_rms.running_mean",
+            "running_mean_std.running_var":  "a2c_network.obs_rms.running_var",
+            "running_mean_std.count":        "a2c_network.obs_rms.count",
+        }
+        for old, new in key_map.items():
+            if old in sd:
+                sd[new] = sd[old]
+        ckpt["model"] = sd
+        torch.save(ckpt, fixed_path)
+        print(f"[INFO] Saved fixed checkpoint to: {fixed_path}")
+
+    resume_path = fixed_path
     agent.restore(resume_path)
     agent.reset()
 
