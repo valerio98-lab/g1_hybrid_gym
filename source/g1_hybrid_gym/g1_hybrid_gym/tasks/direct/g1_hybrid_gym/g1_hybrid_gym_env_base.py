@@ -136,10 +136,8 @@ class G1HybridGymEnvBase(DirectRLEnv):
             self.num_envs, dtype=torch.long, device=self.device
         )
 
-        # cache ref per step (dones->rewards)
         self._cached_ref_tensors: Dict[str, torch.Tensor] | None = None
 
-        # ref tensors (prestack / zero-copy depending on dataset)
         self._ref_root_pos: torch.Tensor | None = None
         self._ref_root_quat_wxyz: torch.Tensor | None = None
         self._ref_root_lin_vel: torch.Tensor | None = None
