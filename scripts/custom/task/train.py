@@ -3,19 +3,23 @@ Task Learning training via rl_games PPO (ModelA2CMultiDiscrete).
 """
 
 from __future__ import annotations
+from pathlib import Path
 
 import argparse
 import datetime
 import os
+import yaml
 
 from isaaclab.app import AppLauncher
 
+PARENT_DIR = Path(__file__).resolve().parent
 
 def main():
     parser = argparse.ArgumentParser("Task Learning — rl_games PPO MultiDiscrete")
 
     parser.add_argument("--num_envs", type=int, default=4096)
     parser.add_argument("--max_iterations", type=int, default=10_000)
+    parser.add_argument("--experiment_name", type=str, required=True)
     parser.add_argument(
         "--log_dir", type=str,
         default=f"./logs/task_learning/{datetime.datetime.now().strftime('%d_%m_%Y_%H%M%S')}",
@@ -53,67 +57,22 @@ def main():
 
     device = str(args.device if torch.cuda.is_available() else "cpu")
 
+    log_dir = str(f"{args.log_dir}_{args.experiment_name}")
     env_cfg = G1HybridGymEnvTaskCfg()
     env_cfg.scene.num_envs = args.num_envs
     env_cfg.sim.device = device
 
     base_env = G1HybridGymEnvTask(cfg=env_cfg, render_mode=None)
 
-
     batch_size = args.num_envs * args.horizon
     minibatch_size = args.minibatch_size or batch_size
 
-    rl_config = {
-        "params": {
-            "seed": 42,
-            "algo": {
-                "name": "a2c_discrete",
-            },
-            "model": {
-                "name": "wrapper_expert_task_ppo",
-            },
-            "network": {
-                "name": "task_a2c",
-            },
-        "env": {
-            "clip_observations": 5.0,
-            "clip_actions": 1.0,
-        },
-            "config": {
-                "name": args.run_name,
-                "log_dir": args.log_dir,
-                "train_dir": args.log_dir,
-                "env_name": "isaaclab_task",
-                "multi_gpu": False,
-                "mixed_precision": False,
-                "normalize_input": False,
-                "normalize_value": True,
-                "value_bootstrap": True,
-                "num_actors": args.num_envs,
-                "reward_shaper": {"scale_value": 1.0},
-                "normalize_advantage": True,
-                "gamma": 0.99,
-                "tau": 0.95,
-                "learning_rate": args.lr,
-                "lr_schedule": "constant",
-                "score_to_win": 1e6,
-                "max_epochs": args.max_iterations,
-                "save_best_after": 50,
-                "save_frequency": 100,
-                "grad_norm": 1.0,
-                "entropy_coef": args.entropy_coef,
-                "truncate_grads": True,
-                "e_clip": 0.2,
-                "horizon_length": args.horizon,
-                "minibatch_size": minibatch_size,
-                "mini_epochs": 4,
-                "critic_coef": 5,
-                "clip_value": True,
-                "seq_length": 4,
-                "bounds_loss_coef": 10.0,
-            },
-        },
-    }
+    cfg_path = Path(PARENT_DIR / "train_config/TaskLearning.yaml")
+    if cfg_path.exists(): 
+        cfg = yaml.safe_load(cfg_path.read_text())
+    else: 
+        raise Exception("[TASK TRAIN]: Config file not found")
+    rl_config = cfg["rl_config"]
 
     from isaaclab_rl.rl_games import RlGamesVecEnvWrapper
     env_rl = RlGamesVecEnvWrapper(base_env, rl_device=device, clip_obs=rl_config["params"]["env"]["clip_observations"], clip_actions=rl_config["params"]["env"]["clip_actions"])
@@ -138,6 +97,7 @@ def main():
         action_dim=physical_action_dim,
         imitation_ckpt_path=args.imitation_ckpt,
         expert_ckpt_path=args.expert_ckpt, 
+        cfg_path=cfg_path
     ).to(device)
 
     critic = TaskCritic(s_dim=s_dim, goal_dim=args.task_goal_dim).to(device)
@@ -194,7 +154,7 @@ def main():
     )
 
 
-    os.makedirs(args.log_dir, exist_ok=True)
+    os.makedirs(args.log_dir , exist_ok=True)
 
     runner = Runner(IsaacAlgoObserver())
     runner.load(rl_config)

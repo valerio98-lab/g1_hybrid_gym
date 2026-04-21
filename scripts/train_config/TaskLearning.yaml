@@ -1,0 +1,66 @@
+
+task_learning_policy: 
+  type: MLPPolicy
+  ##Sigma settings
+  init_log_std: -2.9
+  sigma_fixed: True
+  log_std_min: -5.0
+  log_std_max: 1.0
+  latent_dim: 64  
+  num_active_codebooks: 1
+
+  high_level_policy: 
+    units: [1024, 1024, 512]
+    activation: relu
+
+  critic: 
+    units: [1024, 1024, 512]
+    activation: relu
+
+  rl_config:
+    params: 
+      seed: 42
+      algo:
+        name: a2c_discrete
+      model:
+        name: wrapper_expert_task_ppo
+      network:
+        name: task_a2c
+      env:
+        clip_observations: 5.0
+        clip_actions: 1.0
+      config:
+        name: "<run_name>"
+        log_dir: "<log_dir>"
+        train_dir: "<log_dir>"
+        env_name: isaaclab_task
+        multi_gpu: false
+        mixed_precision: false
+        normalize_input: false
+        normalize_value: true
+        value_bootstrap: true
+        num_actors: <num_envs>
+        reward_shaper:
+          scale_value: 1.0
+        normalize_advantage: true
+        gamma: 0.99
+        tau: 0.95
+        learning_rate: <lr>
+        lr_schedule: constant
+        score_to_win: 1e6
+        max_epochs: <max_iterations>
+        save_best_after: 50
+        save_frequency: 100
+        grad_norm: 1.0
+        entropy_coef: <entropy_coef>
+        truncate_grads: true
+        e_clip: 0.2
+        horizon_length: <horizon>
+        minibatch_size: <minibatch_size>
+        mini_epochs: 4
+        critic_coef: 5
+        clip_value: true
+        seq_length: 4
+        bounds_loss_coef: 10.0
+
+

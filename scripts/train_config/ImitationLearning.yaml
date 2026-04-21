@@ -1,0 +1,50 @@
+imitation_learning_policy: 
+  type: MLPPolicy
+  ##Sigma settings
+  init_log_std: -2.9
+  sigma_fixed: True
+  log_std_min: -5.0
+  log_std_max: 1.0
+  latent_dim: 64
+  use_expert_decoder: False
+
+  prior: 
+    units: [1024, 1024, 512]
+    activation: relu
+
+  posterior:
+    units: [1024, 1024, 512]
+    activation: relu
+
+  action_decoder:
+    hidden_units: [1024, 1024, 512]
+    activation: relu
+
+  rvq_cfg:
+    num_quantizers: 8
+    codebook_size: 1024
+    quantize_dropout: True
+    decay: 0.99
+    eps : 1e-5
+    commitment_weight: 1.0
+    kmeans_init: False
+    kmeans_iters: 10
+    codebook_dim: 64
+    shared_codebook: False
+    rotation_trick: True
+
+  loss_weights:
+    action: 10.0
+    mm: 0.1
+    reg: 0.05
+    vq: 1.0
+  
+  trainer_cfg:
+    use_amp: False
+    mm_warmup_steps: 50000
+    log_every: 50
+    ckpt_every: 1000
+    mm_end: 1.0
+    mm_start: 0.1
+    lr: 0.0002
+    keep_last_k: 0

@@ -1,5 +1,3 @@
-# g1_hybrid_gym/envs/g1_hybrid_gym_env_base.py
-
 # Copyright (c) 2022-2025, The Isaac Lab Project Developers
 # SPDX-License-Identifier: BSD-3-Clause
 
@@ -30,6 +28,9 @@ from g1_hybrid_prior.helpers import (
 
 PARENT_DIR = Path(__file__).parent.parent.parent.parent.parent.resolve()
 
+CUR_OBS_DIM = 81
+GOAL_DIM = 251
+TOTAL_OBS_DIM = 332
 
 class G1HybridGymEnvBase(DirectRLEnv):
     """Classe base comune tra PPO tracking e AMP.
@@ -489,7 +490,6 @@ class G1HybridGymEnvBase(DirectRLEnv):
                 ),
                 dim=-1, # 1 + 4 + 3 + 3 + 29 + 29 + (num_ee*3) = 81
             )
-            #
 
             self.ref_frame_idx.clamp_(0, self.max_frame_idx)
             ref = self._get_ref_batch(self.ref_frame_idx)
@@ -511,6 +511,10 @@ class G1HybridGymEnvBase(DirectRLEnv):
             )
 
             obs = torch.cat((s_cur, goal), dim=-1) #81 + 251 = 332
+            
+            CUR_OBS_DIM = s_cur.shape[-1]
+            GOAL_DIM = goal.shape[-1]
+            TOTAL_OBS_DIM = obs.shape[-1]
 
             return {"policy": obs}
 
