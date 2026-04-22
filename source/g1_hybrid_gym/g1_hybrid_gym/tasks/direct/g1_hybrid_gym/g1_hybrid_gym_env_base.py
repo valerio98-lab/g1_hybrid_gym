@@ -28,9 +28,6 @@ from g1_hybrid_prior.helpers import (
 
 PARENT_DIR = Path(__file__).parent.parent.parent.parent.parent.resolve()
 
-CUR_OBS_DIM = 81
-GOAL_DIM = 251
-TOTAL_OBS_DIM = 332
 
 class G1HybridGymEnvBase(DirectRLEnv):
     """Classe base comune tra PPO tracking e AMP.
@@ -77,7 +74,7 @@ class G1HybridGymEnvBase(DirectRLEnv):
                 torch.as_tensor(joint_idx, dtype=torch.long).reshape(-1).to(self.device)
             )
             g1_dof_idx.append(int(joint_idx_t.item()))
-        
+
         self.body_names_dataset = self.dataset.get_body_names()
         self.body_isaac_indices = None
         if self.body_names_dataset:
@@ -92,7 +89,9 @@ class G1HybridGymEnvBase(DirectRLEnv):
             self.body_isaac_indices = torch.tensor(
                 body_isaac_indices, device=self.device, dtype=torch.long
             )
-            print(f"[{self.__class__.__name__}] Mapped Body Names: {self.body_names_dataset} -> {self.body_isaac_indices.tolist()}")
+            print(
+                f"[{self.__class__.__name__}] Mapped Body Names: {self.body_names_dataset} -> {self.body_isaac_indices.tolist()}"
+            )
 
         self.dataset_to_isaac_indexes = torch.tensor(
             dataset_to_isaac_indexes, device=self.device, dtype=torch.long
@@ -163,12 +162,17 @@ class G1HybridGymEnvBase(DirectRLEnv):
         self._dbg_joint_vel_mse: torch.Tensor | None = None
         self._dbg_root_pos_mse: torch.Tensor | None = None
         self._dbg_ee_pos_mse: torch.Tensor | None = None
-        self._dbg_r_pos : torch.Tensor | None = None 
-        self._dbg_r_vel : torch.Tensor | None = None 
-        self._dbg_r_root_p : torch.Tensor | None = None 
-        self._dbg_r_ee : torch.Tensor | None = None 
+        self._dbg_r_pos: torch.Tensor | None = None
+        self._dbg_r_vel: torch.Tensor | None = None
+        self._dbg_r_root_p: torch.Tensor | None = None
+        self._dbg_r_ee: torch.Tensor | None = None
 
-
+        J = self.dataset.robot_cfg.dof
+        num_ee = self.dataset.robot_cfg.num_ee
+        K = self.dataset.robot_cfg.num_body
+        self.CUR_OBS_DIM = 1 + 4 + 3 + 3 + J + J + (num_ee * 3)  # 81 for G1
+        self.GOAL_DIM = 1 + 4 + 3 + 3 + J + J + (K * 13)  # 251
+        self.TOTAL_OBS_DIM = self.CUR_OBS_DIM + self.GOAL_DIM
 
     def _read_dataset_params(self) -> dict:
         cfg_params_path = str(PARENT_DIR / "config" / "config_param.yaml")
@@ -209,17 +213,25 @@ class G1HybridGymEnvBase(DirectRLEnv):
             )
             # print(f"Dimensione di _ee_pos during frame building: {self._ref_ee_pos.shape}", flush=True)
 
-        if "body_pos" in frames[0]: 
-            self._ref_body_pos = torch.stack([f["body_pos"] for f in frames], dim=0).to(self.device)
+        if "body_pos" in frames[0]:
+            self._ref_body_pos = torch.stack([f["body_pos"] for f in frames], dim=0).to(
+                self.device
+            )
 
         if "body_quat" in frames[0]:
-            self._ref_body_quat = torch.stack([f["body_quat"] for f in frames], dim=0).to(self.device)
-        
+            self._ref_body_quat = torch.stack(
+                [f["body_quat"] for f in frames], dim=0
+            ).to(self.device)
+
         if "body_lin_vel" in frames[0]:
-            self._ref_body_lin_vel = torch.stack([f["body_lin_vel"] for f in frames], dim=0).to(self.device)
-        
+            self._ref_body_lin_vel = torch.stack(
+                [f["body_lin_vel"] for f in frames], dim=0
+            ).to(self.device)
+
         if "body_ang_vel" in frames[0]:
-            self._ref_body_ang_vel = torch.stack([f["body_ang_vel"] for f in frames], dim=0).to(self.device)
+            self._ref_body_ang_vel = torch.stack(
+                [f["body_ang_vel"] for f in frames], dim=0
+            ).to(self.device)
 
     def _get_ref_batch(self, frame_idx: torch.Tensor) -> dict[str, torch.Tensor]:
         idx = frame_idx.clamp(0, self.max_frame_idx)
@@ -337,50 +349,73 @@ class G1HybridGymEnvBase(DirectRLEnv):
             and ref.get("body_ang_vel") is not None
         )
 
-        if has_body_ref and body_state_w is not None and self.body_isaac_indices is not None:
+        if (
+            has_body_ref
+            and body_state_w is not None
+            and self.body_isaac_indices is not None
+        ):
             N = body_state_w.shape[0]
             K = self.body_isaac_indices.shape[0]
 
-            sim_bp = body_state_w[:, self.body_isaac_indices, 0:3] # (N, K, 3) world abs
-            sim_bq = quat_normalize(body_state_w[:, self.body_isaac_indices, 3:7])  # (N, K, 4)
-            sim_bv = body_state_w[:, self.body_isaac_indices, 7:10]  # (N, K, 3) world abs
-            sim_bw = body_state_w[:, self.body_isaac_indices, 10:13] # (N, K, 3) world abs
+            sim_bp = body_state_w[
+                :, self.body_isaac_indices, 0:3
+            ]  # (N, K, 3) world abs
+            sim_bq = quat_normalize(
+                body_state_w[:, self.body_isaac_indices, 3:7]
+            )  # (N, K, 4)
+            sim_bv = body_state_w[
+                :, self.body_isaac_indices, 7:10
+            ]  # (N, K, 3) world abs
+            sim_bw = body_state_w[
+                :, self.body_isaac_indices, 10:13
+            ]  # (N, K, 3) world abs
 
-            root_pos_w = self.robot.data.root_link_state_w[:, :3]# (N, 3)
-            root_vel_w = self.robot.data.root_link_state_w[:, 7:10] # (N, 3)
+            root_pos_w = self.robot.data.root_link_state_w[:, :3]  # (N, 3)
+            root_vel_w = self.robot.data.root_link_state_w[:, 7:10]  # (N, 3)
 
-            sim_bp = sim_bp - root_pos_w.unsqueeze(1) # (N, K, 3)
-            sim_bv = sim_bv - root_vel_w.unsqueeze(1) # (N, K, 3)
+            sim_bp = sim_bp - root_pos_w.unsqueeze(1)  # (N, K, 3)
+            sim_bv = sim_bv - root_vel_w.unsqueeze(1)  # (N, K, 3)
 
-            ref_bp = ref["body_pos"]      # (N, K, 3) root-relative in world
-            ref_bq = ref["body_quat"]     # (N, K, 4) wxyz assoluto in world
+            ref_bp = ref["body_pos"]  # (N, K, 3) root-relative in world
+            ref_bq = ref["body_quat"]  # (N, K, 4) wxyz assoluto in world
             ref_bv = ref["body_lin_vel"]  # (N, K, 3) root-relative in world
             ref_bw = ref["body_ang_vel"]  # (N, K, 3) assoluta in world
 
-            ref_q_exp = einops.repeat(q_ref, 'N dim -> N K dim', K=K) # (N, K, 4)
-            sim_q_exp = einops.repeat(q_cur, 'N dim -> N K dim', K=K) # (N, K, 4)
+            ref_q_exp = einops.repeat(q_ref, "N dim -> N K dim", K=K)  # (N, K, 4)
+            sim_q_exp = einops.repeat(q_cur, "N dim -> N K dim", K=K)  # (N, K, 4)
 
+            ref_bp_local = quat_rotate_inv(ref_q_exp, ref_bp)  # (N, K, 3)
+            ref_bv_local = quat_rotate_inv(ref_q_exp, ref_bv)  # (N, K, 3)
+            ref_bw_local = quat_rotate_inv(ref_q_exp, ref_bw)  # (N, K, 3)
+            ref_bq_local = quat_normalize(
+                quat_mul(quat_inv(ref_q_exp), ref_bq)
+            )  # (N, K, 4)
 
-            ref_bp_local = quat_rotate_inv(ref_q_exp, ref_bp) # (N, K, 3)
-            ref_bv_local = quat_rotate_inv(ref_q_exp, ref_bv) # (N, K, 3)
-            ref_bw_local = quat_rotate_inv(ref_q_exp, ref_bw) # (N, K, 3)
-            ref_bq_local = quat_normalize(quat_mul(quat_inv(ref_q_exp), ref_bq))  # (N, K, 4)
+            sim_bp_local = quat_rotate_inv(sim_q_exp, sim_bp)  # (N, K, 3)
+            sim_bv_local = quat_rotate_inv(sim_q_exp, sim_bv)  # (N, K, 3)
+            sim_bw_local = quat_rotate_inv(sim_q_exp, sim_bw)  # (N, K, 3)
+            sim_bq_local = quat_normalize(
+                quat_mul(quat_inv(sim_q_exp), sim_bq)
+            )  # (N, K, 4)
 
-            sim_bp_local = quat_rotate_inv(sim_q_exp, sim_bp) # (N, K, 3)
-            sim_bv_local = quat_rotate_inv(sim_q_exp, sim_bv) # (N, K, 3)
-            sim_bw_local = quat_rotate_inv(sim_q_exp, sim_bw) # (N, K, 3)
-            sim_bq_local = quat_normalize(quat_mul(quat_inv(sim_q_exp), sim_bq)) # (N, K, 4)
-
-            dp_b = einops.rearrange(ref_bp_local - sim_bp_local, 'N K dim -> N (K dim)')  # (N, K*3)
-            dv_b = einops.rearrange(ref_bv_local - sim_bv_local, 'N K dim -> N (K dim)')  # (N, K*3)
-            dw_b = einops.rearrange(ref_bw_local - sim_bw_local, 'N K dim -> N (K dim)')  # (N, K*3)
+            dp_b = einops.rearrange(
+                ref_bp_local - sim_bp_local, "N K dim -> N (K dim)"
+            )  # (N, K*3)
+            dv_b = einops.rearrange(
+                ref_bv_local - sim_bv_local, "N K dim -> N (K dim)"
+            )  # (N, K*3)
+            dw_b = einops.rearrange(
+                ref_bw_local - sim_bw_local, "N K dim -> N (K dim)"
+            )  # (N, K*3)
             dq_b = einops.rearrange(
                 quat_normalize(quat_mul(ref_bq_local, quat_inv(sim_bq_local))),
-                'N K dim -> N (K dim)'
+                "N K dim -> N (K dim)",
             )  # (N, K*4)
 
-            body_goal = torch.cat((dp_b, dq_b, dv_b, dw_b), dim=-1)  # K*(3+4+3+3) = K*13 = 182
-            goal = torch.cat((goal, body_goal), dim=-1)               # 69 + 182 = 251
+            body_goal = torch.cat(
+                (dp_b, dq_b, dv_b, dw_b), dim=-1
+            )  # K*(3+4+3+3) = K*13 = 182
+            goal = torch.cat((goal, body_goal), dim=-1)  # 69 + 182 = 251
 
         return goal
 
@@ -439,85 +474,112 @@ class G1HybridGymEnvBase(DirectRLEnv):
             log["action_abs_mean"] = _mean(self._dbg_action_abs_mean).item()
         if self._dbg_action_sat_frac is not None:
             log["action_sat_pct"] = _mean(self._dbg_action_sat_frac) * 100.0
-        
-        if self._dbg_r_ee is not None: 
+
+        if self._dbg_r_ee is not None:
             log["ee_reward_term"] = _mean(self._dbg_r_ee).item()
 
-        if self._dbg_r_pos is not None: 
+        if self._dbg_r_pos is not None:
             log["reward_joint_pos_term"] = _mean(self._dbg_r_pos).item()
-        if self._dbg_r_vel is not None: 
+        if self._dbg_r_vel is not None:
             log["reward_joint_vel_term"] = _mean(self._dbg_r_vel).item()
-        if self._dbg_r_root_p is not None: 
+        if self._dbg_r_root_p is not None:
             log["reward_root_position_term"] = _mean(self._dbg_r_root_p).item()
-        
+
         return obs, rew, terminated, truncated, extras
 
-    def _get_observations(self) -> dict:
-            root_link_state = self.robot.data.root_link_state_w  # (N,13)
-            root_pos_w = root_link_state[:, 0:3]
-            root_quat_wxyz = quat_normalize(root_link_state[:, 3:7])  # (N,4)
+    def _get_s_cur(
+        self,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        root_link_state = self.robot.data.root_link_state_w  # (N,13)
+        root_pos_w = root_link_state[:, 0:3]
+        root_quat_wxyz = quat_normalize(root_link_state[:, 3:7])  # (N,4)
 
-            v_link_world = root_link_state[:, 7:10]
-            w_link_world = root_link_state[:, 10:13]
+        v_link_world = root_link_state[:, 7:10]
+        w_link_world = root_link_state[:, 10:13]
 
-            root_lin_vel_body = quat_rotate_inv(root_quat_wxyz, v_link_world)
-            root_ang_vel_body = quat_rotate_inv(root_quat_wxyz, w_link_world)
+        root_lin_vel_body = quat_rotate_inv(root_quat_wxyz, v_link_world)
+        root_ang_vel_body = quat_rotate_inv(root_quat_wxyz, w_link_world)
 
-            env_origins = self.scene.env_origins
-            h = (root_pos_w - env_origins)[:, 2:3]
+        env_origins = self.scene.env_origins
+        h = (root_pos_w - env_origins)[:, 2:3]
 
-            joint_pos = self.robot.data.joint_pos[:, self.dataset_to_isaac_indexes]
-            joint_vel = self.robot.data.joint_vel[:, self.dataset_to_isaac_indexes]
+        joint_pos = self.robot.data.joint_pos[:, self.dataset_to_isaac_indexes]
+        joint_vel = self.robot.data.joint_vel[:, self.dataset_to_isaac_indexes]
 
-            ee_state_w = self.robot.data.body_state_w[:, self.ee_isaac_indices, :3]
-            ee_rel_w = ee_state_w - root_pos_w.unsqueeze(1) # Differenza nel World Frame
-            
-            num_ee = self.ee_isaac_indices.shape[0]
-            q_exp = einops.repeat(root_quat_wxyz, 'N dim -> N K dim', K=num_ee)
-            
-            N = root_pos_w.shape[0]
-            ee_pos_b = quat_rotate_inv(q_exp, ee_rel_w).reshape(N, -1)
+        ee_state_w = self.robot.data.body_state_w[:, self.ee_isaac_indices, :3]
+        ee_rel_w = ee_state_w - root_pos_w.unsqueeze(1)  # Differenza nel World Frame
 
-            s_cur = torch.cat(
-                (
-                    h,
-                    root_quat_wxyz,
-                    root_lin_vel_body,
-                    root_ang_vel_body,
-                    joint_pos,
-                    joint_vel,
-                    ee_pos_b 
-                ),
-                dim=-1, # 1 + 4 + 3 + 3 + 29 + 29 + (num_ee*3) = 81
-            )
+        num_ee = self.ee_isaac_indices.shape[0]
+        q_exp = einops.repeat(root_quat_wxyz, "N dim -> N K dim", K=num_ee)
 
-            self.ref_frame_idx.clamp_(0, self.max_frame_idx)
-            ref = self._get_ref_batch(self.ref_frame_idx)
+        N = root_pos_w.shape[0]
+        ee_pos_b = quat_rotate_inv(q_exp, ee_rel_w).reshape(N, -1)
 
-            body_state_w = None
-            if self.body_isaac_indices is not None:
-                body_state_w = self.robot.data.body_state_w  # (N, num_bodies, 13)
+        s_cur = torch.cat(
+            (
+                h,
+                root_quat_wxyz,
+                root_lin_vel_body,
+                root_ang_vel_body,
+                joint_pos,
+                joint_vel,
+                ee_pos_b,
+            ),
+            dim=-1,  # 1 + 4 + 3 + 3 + 29 + 29 + (num_ee*3) = 81
+        )
 
-            goal = self._build_goal_from_ref(
-                h_cur=h,
-                q_cur_wxyz=root_quat_wxyz,
-                v_cur_body=root_lin_vel_body,
-                w_cur_body=root_ang_vel_body,
-                joint_pos=joint_pos,
-                joint_vel=joint_vel,
-                ref=ref,
-                body_state_w=body_state_w,
-                env_origins=self.scene.env_origins,
-            )
+        return (
+            s_cur,
+            root_quat_wxyz,
+            root_lin_vel_body,
+            root_ang_vel_body,
+            joint_pos,
+            joint_vel,
+            h,
+        )
 
-            obs = torch.cat((s_cur, goal), dim=-1) #81 + 251 = 332
-            
-            CUR_OBS_DIM = s_cur.shape[-1]
-            GOAL_DIM = goal.shape[-1]
-            TOTAL_OBS_DIM = obs.shape[-1]
+    def _get_observations(self) -> dict[str, torch.Tensor]:
 
-            return {"policy": obs}
+        (
+            s_cur,
+            root_quat_wxyz,
+            root_lin_vel_body,
+            root_ang_vel_body,
+            joint_pos,
+            joint_vel,
+            h,
+        ) = self._get_s_cur()
 
+        self.ref_frame_idx.clamp_(0, self.max_frame_idx)
+        ref = self._get_ref_batch(self.ref_frame_idx)
+
+        body_state_w = None
+        if self.body_isaac_indices is not None:
+            body_state_w = self.robot.data.body_state_w  # (N, num_bodies, 13)
+
+        goal = self._build_goal_from_ref(
+            h_cur=h,
+            q_cur_wxyz=root_quat_wxyz,
+            v_cur_body=root_lin_vel_body,
+            w_cur_body=root_ang_vel_body,
+            joint_pos=joint_pos,
+            joint_vel=joint_vel,
+            ref=ref,
+            body_state_w=body_state_w,
+            env_origins=self.scene.env_origins,
+        )
+
+        obs = torch.cat((s_cur, goal), dim=-1)  # 81 + 251 = 332
+
+        return {"policy": obs}
 
     def _get_dones(self):
         """Base: solo timeout + fallen. I figli possono estendere con early termination."""
@@ -608,15 +670,15 @@ class G1HybridGymEnvBase(DirectRLEnv):
         if self.ee_isaac_indices is not None and ref.get("ee_pos") is not None:
             N = root_pos_w.shape[0]
             num_ee = self.ee_isaac_indices.shape[0]
-            
+
             ee_state_w = self.robot.data.body_state_w[:, self.ee_isaac_indices, 0:3]
             ee_rel_w_sim = ee_state_w - root_link_state[:, 0:3].unsqueeze(1)
-            sim_q_exp = einops.repeat(root_quat_w, 'N dim -> N K dim', K=num_ee)
+            sim_q_exp = einops.repeat(root_quat_w, "N dim -> N K dim", K=num_ee)
             ee_pos_local_sim = quat_rotate_inv(sim_q_exp, ee_rel_w_sim)
 
             ee_rel_w_ref = ref["ee_pos"]
             ref_root_quat = quat_normalize(ref["root_quat_wxyz"])
-            ref_q_exp = einops.repeat(ref_root_quat, 'N dim -> N K dim', K=num_ee)
+            ref_q_exp = einops.repeat(ref_root_quat, "N dim -> N K dim", K=num_ee)
             ee_pos_local_ref = quat_rotate_inv(ref_q_exp, ee_rel_w_ref)
 
         with torch.no_grad():
@@ -626,7 +688,9 @@ class G1HybridGymEnvBase(DirectRLEnv):
 
             if ee_pos_local_sim is not None and ee_pos_local_ref is not None:
                 self._dbg_ee_pos_mse = (
-                    ((ee_pos_local_sim - ee_pos_local_ref) ** 2).sum(dim=-1).mean(dim=-1)
+                    ((ee_pos_local_sim - ee_pos_local_ref) ** 2)
+                    .sum(dim=-1)
+                    .mean(dim=-1)
                 )
             else:
                 self._dbg_ee_pos_mse = None
@@ -644,7 +708,7 @@ class G1HybridGymEnvBase(DirectRLEnv):
             root_pos_w,
             root_quat_w,
             (
-                ee_pos_local_sim 
+                ee_pos_local_sim
                 if ee_pos_local_sim is not None
                 else torch.zeros((self.num_envs, 1, 3), device=self.device)
             ),
@@ -653,13 +717,13 @@ class G1HybridGymEnvBase(DirectRLEnv):
             ref["joint_vel"],
             ref["root_pos"],
             ref["root_quat_wxyz"],
-            ee_pos_local_ref, 
+            ee_pos_local_ref,
             self.reset_terminated,
         )
 
         self._dbg_r_pos = r_pos
         self._dbg_r_vel = r_vel
-        self._dbg_r_root_p = r_root_p 
+        self._dbg_r_root_p = r_root_p
         self._dbg_r_ee = r_ee
 
         alive = ~self.reset_buf

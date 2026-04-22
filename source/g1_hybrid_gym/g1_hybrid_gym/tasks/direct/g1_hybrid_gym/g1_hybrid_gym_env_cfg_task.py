@@ -1,7 +1,7 @@
 # g1_hybrid_gym/tasks/direct/g1_hybrid_gym/g1_hybrid_gym_env_task_cfg.py
 """
 Environment config for task learning.
-Observation: s_cur(69) + vel_cmd(3) = 72
+Observation: s_cur(81) + vel_cmd(3) = 84
 Action: 29 joint targets (physical actions from frozen decoder)
 """
 from isaaclab.utils import configclass
@@ -12,8 +12,8 @@ from .g1_hybrid_gym_env_cfg import G1HybridGymEnvCfg
 class G1HybridGymEnvTaskCfg(G1HybridGymEnvCfg):
     episode_length_s = 6.0
 
-    # Observation: s_cur(69) + vel_cmd(3) = 72
-    observation_space = 72
+    # Observation: s_cur(81) + vel_cmd(3) = 84
+    observation_space = 84
 
     # Action: physical joint targets (decoder output, NOT codebook indices)
     # The env wrapper handles the discrete→continuous translation

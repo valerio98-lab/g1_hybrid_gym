@@ -99,7 +99,8 @@ class G1HybridGymEnvImitation(G1HybridGymEnvBase):
             and self.body_isaac_indices is not None
         ):
             curr_body_pos = self.robot.data.body_state_w[:, self.body_isaac_indices, 0:3]
-            curr_body_pos_rel = curr_body_pos - self.scene.env_origins.unsqueeze(1)
+            root_pos_w = self.robot.data.root_link_state_w[:, :3]
+            curr_body_pos_rel = curr_body_pos - root_pos_w.unsqueeze(1)
 
             pos_dist = torch.linalg.norm(curr_body_pos_rel - ref["body_pos"], dim=-1)  # (N,K)
 

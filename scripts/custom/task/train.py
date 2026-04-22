@@ -12,7 +12,7 @@ import yaml
 
 from isaaclab.app import AppLauncher
 
-PARENT_DIR = Path(__file__).resolve().parent
+PARENT_DIR = Path(__file__).resolve().parents[2]
 
 def main():
     parser = argparse.ArgumentParser("Task Learning — rl_games PPO MultiDiscrete")
@@ -68,11 +68,24 @@ def main():
     minibatch_size = args.minibatch_size or batch_size
 
     cfg_path = Path(PARENT_DIR / "train_config/TaskLearning.yaml")
+    cfg_path_imitation = Path(PARENT_DIR / "train_config/ImitationLearning.yaml")
+
     if cfg_path.exists(): 
         cfg = yaml.safe_load(cfg_path.read_text())
     else: 
-        raise Exception("[TASK TRAIN]: Config file not found")
-    rl_config = cfg["rl_config"]
+        raise Exception("[TASK TRAIN]: Config file not found", cfg_path)
+    rl_config = cfg["task_learning_policy"]["rl_config"]
+
+    rl_config["params"]["config"]["name"] = args.run_name
+    rl_config["params"]["config"]["log_dir"] = log_dir
+    rl_config["params"]["config"]["train_dir"] = log_dir
+    rl_config["params"]["config"]["num_actors"] = args.num_envs
+    rl_config["params"]["config"]["max_epochs"] = args.max_iterations
+    rl_config["params"]["config"]["horizon_length"] = args.horizon
+    rl_config["params"]["config"]["minibatch_size"] = args.minibatch_size
+    rl_config["params"]["config"]["learning_rate"] = args.lr
+    rl_config["params"]["config"]["entropy_coef"] = args.entropy_coef
+    rl_config["params"]["config"]["score_to_win"] = float(cfg["task_learning_policy"]["rl_config"]["params"]["config"]["score_to_win"])
 
     from isaaclab_rl.rl_games import RlGamesVecEnvWrapper
     env_rl = RlGamesVecEnvWrapper(base_env, rl_device=device, clip_obs=rl_config["params"]["env"]["clip_observations"], clip_actions=rl_config["params"]["env"]["clip_actions"])
@@ -82,25 +95,29 @@ def main():
         obs_reset = obs_reset[0]
     obs_policy = obs_reset["policy"]
     full_obs_dim = obs_policy.shape[-1]
-    s_dim = full_obs_dim - args.task_goal_dim
+    # Prefer env-reported dims (handles reaching task with task_goal_dim=8 automatically)
+    task_goal_dim = getattr(base_env, "task_goal_dim", args.task_goal_dim)
+    s_dim = full_obs_dim - task_goal_dim
     physical_action_dim = 29
 
-    print(f"[INFO] obs_dim={full_obs_dim}, s_dim={s_dim}, task_goal_dim={args.task_goal_dim}")
+    print(f"[INFO] obs_dim={full_obs_dim}, s_dim={s_dim}, task_goal_dim={task_goal_dim}")
 
 
     from g1_hybrid_prior.models.task_learning_block import TaskLearningBlock, TaskCritic
 
     task_block = TaskLearningBlock(
         s_dim=s_dim,
-        goal_dim=s_dim,
-        task_goal_dim=args.task_goal_dim,
+        goal_dim=base_env.GOAL_DIM,
+        task_goal_dim=task_goal_dim,
         action_dim=physical_action_dim,
         imitation_ckpt_path=args.imitation_ckpt,
         expert_ckpt_path=args.expert_ckpt, 
-        cfg_path=cfg_path
+        cfg_path=cfg_path,
+        imitation_cfg_path=cfg_path_imitation,
+
     ).to(device)
 
-    critic = TaskCritic(s_dim=s_dim, goal_dim=args.task_goal_dim).to(device)
+    critic = TaskCritic(s_dim=s_dim, goal_dim=args.task_goal_dim, cfg_path=cfg_path).to(device)
 
     a2c_network = TaskA2CNetwork(
         task_block=task_block,

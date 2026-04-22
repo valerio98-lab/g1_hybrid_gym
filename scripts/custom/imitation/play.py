@@ -5,63 +5,29 @@ import torch
 import yaml
 from pathlib import Path
 from typing import Tuple
-from collections import OrderedDict
 
 from isaaclab.app import AppLauncher
 
-from g1_hybrid_prior.models.expert_policy import ExpertPolicy
-from g1_hybrid_prior.models.hybrid_imitation_block import ImitationBlock
+OBS_CLIP = 5.0
+PARENT_DIR = Path(__file__).parents[2]
 
 
-def _split_obs(obs_policy: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    full_dim = obs_policy.shape[-1]
-    if full_dim % 2 != 0:
-        raise RuntimeError(f"Expected even obs dim, got {full_dim}")
-    s_dim = full_dim // 2
-    s = obs_policy[..., :s_dim]
-    goal = obs_policy[..., s_dim:]
+def _split_obs(obs_policy: torch.Tensor, CUR_OBS_DIM: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    s = obs_policy[..., :CUR_OBS_DIM]
+    goal = obs_policy[..., CUR_OBS_DIM:]
     return s, goal
-
-
-def _load_expert(expert: ExpertPolicy, ckpt_path: str, device: torch.device) -> None:
-    print(f"[INFO] Loading expert from {ckpt_path}")
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-
-    sd = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
-    sd = {k: v for k, v in sd.items() if k.startswith("a2c_network.")}
-    sd = OrderedDict((k.replace("a2c_network.", "", 1), v) for k, v in sd.items())
-
-    missing, unexpected = expert.load_state_dict(sd, strict=False)
-    print(f"[INFO] Expert loaded. missing={len(missing)} unexpected={len(unexpected)}")
 
 
 def main():
     parser = argparse.ArgumentParser("Play trained imitation policy")
 
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        required=True,
-        help="Path to the student (imitation) checkpoint (ckpt_*.pt or raw state_dict).",
-    )
-    parser.add_argument(
-        "--num_envs",
-        type=int,
-        default=1,
-        help="Number of environments to simulate (default 1 for viz).",
-    )
+    parser.add_argument("--checkpoint", type=str, required=True,
+                        help="Path to the student (imitation) checkpoint.")
+    parser.add_argument("--num_envs", type=int, default=1)
+    parser.add_argument("--expert_checkpoint", type=str, required=True,
+                        help="Path to the expert PPO checkpoint (rl_games .pth).")
+    parser.add_argument("--control", choices=["student", "expert"], default="student")
 
-    # Expert checkpoint for (A) expert decoder (if enabled) AND (B) debug comparison prints
-    parser.add_argument(
-        "--expert_checkpoint",
-        type=str,
-        default="/home/valerio/g1_hybrid_gym/logs/rl_games/g1_hybrid_expert_PPO/2026-01-15_17-39-38/nn/g1_hybrid_expert_PPO.pth",
-        help="Path to the expert PPO checkpoint (rl_games .pth).",
-    )
-    parser.add_argument("--control", choices=["student", "expert"], default="student",
-                        help="Whether to control the env with the student or expert policy.")
-
-    # Isaac Lab standard args
     AppLauncher.add_app_launcher_args(parser)
     args, _unknown = parser.parse_known_args()
 
@@ -75,87 +41,64 @@ def main():
 
     import g1_hybrid_gym.tasks  # noqa: F401
     from g1_hybrid_gym.tasks.direct.g1_hybrid_gym.g1_hybrid_gym_env_cfg import G1HybridGymEnvCfg
-    from g1_hybrid_gym.tasks.direct.g1_hybrid_gym.g1_hybrid_gym_env_imitation import (
-        G1HybridGymEnvImitation,
-    )
+    from g1_hybrid_gym.tasks.direct.g1_hybrid_gym.g1_hybrid_gym_env_imitation import G1HybridGymEnvImitation
+    from g1_hybrid_prior.models.expert_policy import ExpertPolicy
+    from g1_hybrid_prior.models.hybrid_imitation_block import ImitationBlock
 
     device = torch.device(args.device)
 
-    # Environment config
     env_cfg = G1HybridGymEnvCfg()
     env_cfg.scene.num_envs = args.num_envs
     env_cfg.sim.device = str(device)
 
     print(f"[INFO] Creating environment with {args.num_envs} envs...")
-    env = G1HybridGymEnvImitation(
-        cfg=env_cfg, render_mode="rgb_array" if args.headless else None
-    )
+    env = G1HybridGymEnvImitation(cfg=env_cfg, render_mode="rgb_array" if args.headless else None)
 
-    # First reset to infer dims
     obs_dict = env.reset()
     if isinstance(obs_dict, tuple):
         obs_dict = obs_dict[0]
 
-    obs_policy = obs_dict["policy"]
-    obs_dim = int(obs_policy.shape[-1])
-    s_dim = obs_dim // 2
-    goal_dim = obs_dim // 2
+    # Use env-exposed dims (consistent with train script)
+    CUR_OBS_DIM = env.CUR_OBS_DIM
+    GOAL_DIM = env.GOAL_DIM
 
-    # Infer action dim
     try:
-        if hasattr(env, "single_action_space"):
-            action_dim = int(env.single_action_space.shape[0])
-        else:
-            action_dim = int(env.action_space.shape[0])
+        action_dim = int(env.single_action_space.shape[0]) if hasattr(env, "single_action_space") else int(env.action_space.shape[0])
     except Exception:
         action_dim = int(env_cfg.action_space)
 
-    print(f"[INFO] Dimensions: S={s_dim}, Goal={goal_dim}, Action={action_dim}")
+    print(f"[INFO] Dimensions: S={CUR_OBS_DIM}, Goal={GOAL_DIM}, Action={action_dim}")
 
-    # Read YAML to decide if we must use expert decoder inside student model
-    cfg_path = Path("/home/valerio/g1_hybrid_prior/config/ImitationLearning.yaml")
+    cfg_path = Path(PARENT_DIR / "train_config/ImitationLearning.yaml")
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"Config not found: {cfg_path}")
     net_cfg = yaml.safe_load(cfg_path.read_text())
-    use_expert_decoder = bool(
-        net_cfg["imitation_learning_policy"].get("use_expert_decoder", False)
-    )
+    use_expert_decoder = bool(net_cfg["imitation_learning_policy"].get("use_expert_decoder", False))
+    print(f"[INFO] use_expert_decoder={use_expert_decoder}")
 
-    print(f"[INFO] use_expert_decoder from yaml = {use_expert_decoder}")
-    
-    EXPERT_CKPT = "/home/valerio/g1_hybrid_gym/logs/rl_games/g1_hybrid_expert_PPO/2026-01-15_17-39-38/nn/g1_hybrid_expert_PPO.pth"
-
-    expert = ExpertPolicy(obs_dim=s_dim, goal_dim=goal_dim, action_dim=action_dim, device=str(device)).to(device)
+    expert = ExpertPolicy(obs_dim=CUR_OBS_DIM, goal_dim=GOAL_DIM, action_dim=action_dim, device=str(device)).to(device)
     expert.eval()
-    expert.load_from_rlgames(EXPERT_CKPT, strict=False, load_rms=True, enable_rms=False, clip=5.0)
+    expert.load_from_rlgames(args.expert_checkpoint, strict=False, load_rms=True, enable_rms=False, clip=OBS_CLIP)
 
     expert_decoder = expert.decoder if use_expert_decoder else None
 
-    # --- Build student ---
     model = ImitationBlock(
-        s_dim=s_dim,
-        goal_dim=goal_dim,
+        s_dim=CUR_OBS_DIM,
+        goal_dim=GOAL_DIM,
         action_dim=action_dim,
         expert_decoder=expert_decoder,
+        net_cfg_path=cfg_path,
     ).to(device)
     model.eval()
 
-    # --- Load student checkpoint ---
     print(f"[INFO] Loading student checkpoint from: {args.checkpoint}")
-    ckpt = torch.load(args.checkpoint, map_location=device)
-
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     if isinstance(ckpt, dict):
-        if "model" in ckpt:
-            state_dict = ckpt["model"]
-        elif "state_dict" in ckpt:
-            state_dict = ckpt["state_dict"]
-        else:
-            state_dict = ckpt
+        state_dict = ckpt.get("model", ckpt.get("state_dict", ckpt))
     else:
         state_dict = ckpt
-
-    # strict=True = fail fast if mismatch
     model.load_state_dict(state_dict, strict=True)
     print("[INFO] Student loaded with strict=True (OK).")
-
 
     print("[INFO] Starting play loop...")
 
@@ -168,29 +111,20 @@ def main():
         while simulation_app.is_running():
             t += 1
             obs_policy = obs_dict["policy"].to(device=device, dtype=torch.float32)
-            s, goal = _split_obs(obs_policy)
+            s, goal = _split_obs(obs_policy, CUR_OBS_DIM)
 
-            # normalize exactly like training
             full = torch.cat([s, goal], dim=-1)
-            full_n = expert.obs_rms.normalize(full, clip=5.0)
-            s_n = full_n[..., :s_dim]
-            goal_n = full_n[..., s_dim:]
+            full_n = expert.obs_rms.normalize(full, clip=OBS_CLIP)
+            s_n = full_n[..., :CUR_OBS_DIM]
+            goal_n = full_n[..., CUR_OBS_DIM:]
 
-            # --- compute both ---
             mu_expert, _, _ = expert(s_n, goal_n)
-
             out = model(s_n, goal_n)
             a_student = out["a_hat"] if isinstance(out, dict) else out
 
-            # --- choose control source ---
-            if args.control == "expert":
-                actions = mu_expert
-            else:
-                actions = a_student
-
+            actions = (mu_expert if args.control == "expert" else a_student)
             actions = actions.to(device=device, dtype=torch.float32).clamp(-1.0, 1.0)
 
-            # --- debug print every 50 steps (always compares student vs expert) ---
             if (t % 50) == 0:
                 mse = ((a_student - mu_expert) ** 2).mean().item()
                 cos = torch.nn.functional.cosine_similarity(a_student, mu_expert, dim=-1).mean().item()
@@ -204,7 +138,6 @@ def main():
                 actions = actions.unsqueeze(0)
 
             obs_dict, rew, terminated, truncated, extras = env.step(actions)
-
 
     print("[INFO] Closing...")
     env.close()

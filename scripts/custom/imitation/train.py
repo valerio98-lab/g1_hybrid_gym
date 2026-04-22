@@ -23,7 +23,7 @@ def main():
     parser = argparse.ArgumentParser("Train imitation block (online distillation)")
 
     parser.add_argument("--num_envs", type=int, default=8192)
-    parser.add_argument("--steps", type=int, default=200_000)
+    parser.add_argument("--steps", type=int, default=110_000)
     parser.add_argument("--experiment_name", type=str, required=True)
     parser.add_argument("--log_dir", type=str, default=f"./logs/imitation/{datetime.datetime.now().strftime('%d_%m_%Y_%H%M%S')}")
     parser.add_argument("--run_name", type=str, default="g1_hybrid_imitation")
@@ -49,6 +49,9 @@ def main():
     
     from g1_hybrid_gym.tasks.direct.g1_hybrid_gym.g1_hybrid_gym_env_cfg import G1HybridGymEnvCfg
     from g1_hybrid_gym.tasks.direct.g1_hybrid_gym.g1_hybrid_gym_env_imitation import G1HybridGymEnvImitation
+    from g1_hybrid_prior.models.expert_policy import ExpertPolicy
+    from g1_hybrid_prior.models.hybrid_imitation_block import ImitationBlock
+    from g1_hybrid_prior.trainers.imitation_trainer import ImitationTrainer, TrainerCfg, LossWeights
     
     ##############################
 
@@ -69,17 +72,10 @@ def main():
              action_dim = int(env.single_action_space.shape[0])
     except:
          action_dim = int(env_cfg.action_space)
+    
 
-    ### DO NOT MOVE THIS IMPORTS ###
-    from g1_hybrid_prior.models.expert_policy import ExpertPolicy
-    from g1_hybrid_prior.models.hybrid_imitation_block import ImitationBlock
-    from g1_hybrid_prior.trainers.imitation_trainer import ImitationTrainer, TrainerCfg, LossWeights
-    from g1_hybrid_gym.tasks.direct.g1_hybrid_gym.g1_hybrid_gym_env_base import CUR_OBS_DIM, GOAL_DIM, TOTAL_OBS_DIM
-    ##############################
-
-    s_dim = CUR_OBS_DIM
-    goal_dim = GOAL_DIM
-
+    CUR_OBS_DIM = env.CUR_OBS_DIM
+    GOAL_DIM = env.GOAL_DIM
     print(f"[INFO] Dimensions: S={CUR_OBS_DIM}, Goal={GOAL_DIM}, Action={action_dim}")
 
 
@@ -169,7 +165,7 @@ def main():
 
     if args.resume_from_ckpt is not None:
         print(f"[INFO] Resuming student from {args.resume_from_ckpt}")
-        trainer.load_checkpoint(args.resume_from_ckpt)
+        trainer.load(args.resume_from_ckpt)
         print(f"[INFO] Resumed at global_step={trainer.global_step}")
 
     obs = _reset_env(env)
@@ -270,7 +266,6 @@ def _step_env(env, action: torch.Tensor):
     return env.step(action)
 
 def _split_obs(obs_policy: torch.Tensor, CUR_OBS_DIM) -> Tuple[torch.Tensor, torch.Tensor]:
-    full_dim = obs_policy.shape[-1]
     s = obs_policy[..., :CUR_OBS_DIM]
     goal = obs_policy[..., CUR_OBS_DIM:]
     return s, goal

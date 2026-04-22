@@ -7,7 +7,7 @@ task_learning_policy:
   log_std_min: -5.0
   log_std_max: 1.0
   latent_dim: 64  
-  num_active_codebooks: 1
+  num_active_codebooks: 3
 
   high_level_policy: 
     units: [1024, 1024, 512]

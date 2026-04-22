@@ -26,15 +26,15 @@ dataset_params:
     - "right_wrist_yaw_link"
   vx_range: [-0.5, 3.0]
   vy_range: [-0.8, 0.8]
-  orientation_range: [-180.0, 180.0]
-  max_omega: 0.2
+  orientation_range: [-180.0, 180.0] # If fixed, set min and max to the same value, in degrees
+  max_omega: 180.0
   cmd_resample_seconds: 2.5
-  rew_w_in_vel: 0.66
-  rew_w_ang_vel: 0.33
+  rew_w_in_vel: 0.5 #0.66
+  rew_w_ang_vel: 0.5 #0.33
   rew_w_lin_vel_penalty: 3.0
   rew_w_ang_vel_penalty: 6.0 
   vx_shrink_factor: 1.5
-  omega_decay_threshold: 3.0
+  kp_yaw: 1.0
 
 
 

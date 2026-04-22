@@ -9,6 +9,7 @@ Command resampling: every N seconds within episode for transition learning
 """
 from __future__ import annotations
 
+import math
 import torch
 from typing import Dict, Optional
 
@@ -22,6 +23,7 @@ from g1_hybrid_prior.helpers import (
     get_angle_from_quat,
     wrap_to_pi,
 )
+
 from isaaclab.envs import DirectRLEnv
 
 
@@ -69,7 +71,7 @@ class G1HybridGymEnvTask(G1HybridGymEnvBase):
             flush=True,
         )
         self.vx_shrink_factor = float(params.get("vx_shrink_factor", 1.5))
-        self.max_omega = float(params.get("max_omega", 0.5))
+        self.max_omega = math.radians(float(params.get("max_omega", 28.6)))
         print(
             "[INFO] Using max_omega =",
             self.max_omega,
@@ -89,8 +91,6 @@ class G1HybridGymEnvTask(G1HybridGymEnvBase):
         self.cmd_resample_steps = int(
             self.cmd_resample_seconds / (self.cfg.sim.dt * self.cfg.decimation)
         )
-        self.omega_decay_threshold = float(params.get("omega_decay_threshold", 0.5))
-
         self.rew_w_lin_vel = float(params.get("rew_w_lin_vel", 1.0))
         self.rew_w_ang_vel = float(params.get("rew_w_ang_vel", 0.5))
         self.rew_w_lin_vel_penalty = float(params.get("rew_w_lin_vel_penalty", 2.0))
@@ -101,8 +101,9 @@ class G1HybridGymEnvTask(G1HybridGymEnvBase):
             self.num_envs, dtype=torch.long, device=self.device
         )
 
-        J = len(self.dataset.robot_cfg.joint_order)
-        self.s_dim = 1 + 4 + 3 + 3 + J + J  # 69 for G1
+        J = self.dataset.robot_cfg.dof
+        num_ee = self.dataset.robot_cfg.num_ee
+        self.s_dim = 1 + 4 + 3 + 3 + J + J + (num_ee*3)  # 69 for G1
         self.task_goal_dim = 3
 
         self.yaw_target = torch.zeros(self.num_envs, device=self.device)
@@ -148,43 +149,18 @@ class G1HybridGymEnvTask(G1HybridGymEnvBase):
         if hasattr(self, 'fixed_orientation') and self.fixed_orientation is not None:
             sampled_orientation = torch.full((n,), self.fixed_orientation, device=self.device)
 
-        self.yaw_target[env_ids] = current_yaw + sampled_orientation
+        self.yaw_target[env_ids] = current_yaw + torch.deg2rad(sampled_orientation)
         self.vel_cmd[env_ids, 0] = vx
         self.vel_cmd[env_ids, 1] = vy
         self.cmd_timer[env_ids] = 0
 
-    def _get_observations(self) -> dict:
+    def _get_observations(self) -> dict[str, torch.Tensor]:
         """
         Override base: goal = velocity command instead of reference state difference.
         Returns obs["policy"] = [s_cur, vel_cmd]
         """
-        root_link_state = self.robot.data.root_link_state_w  # (N, 13)
-        root_pos_w = root_link_state[:, 0:3]
-        root_quat_wxyz = quat_normalize(root_link_state[:, 3:7])
 
-        v_link_world = root_link_state[:, 7:10]
-        w_link_world = root_link_state[:, 10:13]
-
-        root_lin_vel_body = quat_rotate_inv(root_quat_wxyz, v_link_world)
-        root_ang_vel_body = quat_rotate_inv(root_quat_wxyz, w_link_world)
-
-        env_origins = self.scene.env_origins
-        h = (root_pos_w - env_origins)[:, 2:3]
-
-        joint_pos = self.robot.data.joint_pos[:, self.dataset_to_isaac_indexes]
-        joint_vel = self.robot.data.joint_vel[:, self.dataset_to_isaac_indexes]
-
-        s_cur = torch.cat(
-            (
-                h,
-                root_quat_wxyz,
-                root_lin_vel_body,
-                root_ang_vel_body,
-                joint_pos,
-                joint_vel,
-            ),
-            dim=-1,
-        )
+        s_cur, root_quat_wxyz, root_lin_vel_body, root_ang_vel_body, _, _, _ = super()._get_s_cur()  # (N, s_dim) including
 
         _, _, current_yaw = get_angle_from_quat(root_quat_wxyz)
         yaw_error = wrap_to_pi(self.yaw_target - current_yaw)
