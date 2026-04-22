@@ -95,12 +95,10 @@ def main():
         obs_reset = obs_reset[0]
     obs_policy = obs_reset["policy"]
     full_obs_dim = obs_policy.shape[-1]
-    # Prefer env-reported dims (handles reaching task with task_goal_dim=8 automatically)
-    task_goal_dim = getattr(base_env, "task_goal_dim", args.task_goal_dim)
-    s_dim = full_obs_dim - task_goal_dim
+    s_dim = full_obs_dim - args.task_goal_dim
     physical_action_dim = 29
 
-    print(f"[INFO] obs_dim={full_obs_dim}, s_dim={s_dim}, task_goal_dim={task_goal_dim}")
+    print(f"[INFO] obs_dim={full_obs_dim}, s_dim={s_dim}, task_goal_dim={args.task_goal_dim}")
 
 
     from g1_hybrid_prior.models.task_learning_block import TaskLearningBlock, TaskCritic
@@ -108,7 +106,7 @@ def main():
     task_block = TaskLearningBlock(
         s_dim=s_dim,
         goal_dim=base_env.GOAL_DIM,
-        task_goal_dim=task_goal_dim,
+        task_goal_dim=args.task_goal_dim,
         action_dim=physical_action_dim,
         imitation_ckpt_path=args.imitation_ckpt,
         expert_ckpt_path=args.expert_ckpt, 

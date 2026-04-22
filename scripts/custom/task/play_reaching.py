@@ -1,22 +1,30 @@
 """
-Play / evaluate a trained task-learning policy.
+Play / evaluate the task-learning policy on the arm reaching task.
 1 control step = decimation(4) * dt(1/120s) ≈ 33ms  →  30 steps ≈ 1s
 
-Usage (fixed command):
-  python play.py --checkpoint ... --imitation_ckpt ... --expert_ckpt ... --vx 1.0
+Usage (free resampling):
+  python play_reaching.py --checkpoint ... --imitation_ckpt ... --expert_ckpt ...
 
-Scenario A – explicit turn (forward → rotate 180° → forward):
-  --phases '[{"vx":1.0,"vy":0,"yaw_deg":0,"steps":60},
-             {"vx":0.0,"vy":0,"yaw_deg":180,"steps":60},
-             {"vx":1.0,"vy":0,"yaw_deg":0,"steps":60}]'
+Scenario 1 – stand still + reach:
+  --phases '[{"vx":0.0,"vy":0,"steps":180}]'
 
-Scenario B – implicit flip (forward → reverse vx, no yaw cmd):
-  --phases '[{"vx":1.0,"vy":0,"yaw_deg":0,"steps":90},
-             {"vx":-1.0,"vy":0,"yaw_deg":0,"steps":90}]'
+Scenario 2 – walk + reach:
+  --phases '[{"vx":0.8,"vy":0,"steps":180}]'
+
+Scenario 3 – walk with arms as wings (fixed targets):
+  --phases '[{"vx":0.8,"vy":0,
+              "ee_targets":[[-0.05,-0.65,1.0],[-0.05,0.65,1.0]],
+              "steps":180}]'
+
+Multi-phase example (stand → walk → wings):
+  --phases '[{"vx":0.0,"vy":0,"steps":90},
+             {"vx":0.8,"vy":0,"steps":90},
+             {"vx":0.8,"vy":0,"ee_targets":[[-0.05,-0.65,1.0],[-0.05,0.65,1.0]],"steps":90}]'
 
 Note: max_steps=0 runs indefinitely (Ctrl+C to stop).
-      For phase sequences the loop exits after all phases complete
-      regardless of max_steps.
+      ee_targets: list of [x, y, z] per arm EE in robot body frame.
+      Order matches reaching_arm_ee_names in config (default: right hand, left hand).
+      Set to null in a phase to resume free resampling: {"vx":0.8,"ee_targets":null,"steps":90}
 """
 from __future__ import annotations
 from pathlib import Path
@@ -33,20 +41,28 @@ from isaaclab.app import AppLauncher
 PARENT_DIR = Path(__file__).resolve().parents[2]
 
 
+# ---------------------------------------------------------------------------
+# Phase helpers
+# ---------------------------------------------------------------------------
 
 def _apply_phase(env, phase: dict, device: str, phase_idx: int) -> None:
     """Force all envs to adopt the new command immediately."""
     env.fixed_vx = float(phase["vx"])
     env.fixed_vy = float(phase.get("vy", 0.0))
-    # yaw_deg is a delta in degrees added to current_yaw inside _resample_commands
-    env.fixed_orientation = float(phase.get("yaw_deg", 0.0))
+
+    ee_targets = phase.get("ee_targets", None)
+    if ee_targets is not None:
+        env.fixed_ee_targets = [tuple(t) for t in ee_targets]
+    else:
+        env.fixed_ee_targets = None
 
     all_ids = torch.arange(env.num_envs, device=device, dtype=torch.long)
     env._resample_commands(all_ids)
 
+    ee_str = str(ee_targets) if ee_targets is not None else "free resample"
     print(
         f"\n[PHASE {phase_idx}] vx={env.fixed_vx:+.2f}  vy={env.fixed_vy:+.2f}"
-        f"  yaw_delta={env.fixed_orientation:+.1f}°  duration={phase['steps']} steps",
+        f"  ee_targets={ee_str}  duration={phase['steps']} steps",
         flush=True,
     )
 
@@ -54,16 +70,13 @@ def _apply_phase(env, phase: dict, device: str, phase_idx: int) -> None:
 def _print_phase_histogram(
     hist: torch.Tensor, phase_idx: int, phase: dict, top_k: int = 5
 ) -> None:
-    """
-    hist: (num_active, codebook_size) — cumulative index counts for this phase.
-    Prints top-k most used indices per codebook slot.
-    """
+    """hist: (num_active, codebook_size) — cumulative index counts for this phase."""
     num_active, codebook_size = hist.shape
     total = hist.sum().item()
+    ee_str = "fixed" if phase.get("ee_targets") else "free"
     print(
         f"\n[PHASE {phase_idx} HISTOGRAM] "
-        f"vx={phase['vx']:+.2f} yaw_deg={phase.get('yaw_deg', 0.0):+.1f}°  "
-        f"total_selections={int(total)}"
+        f"vx={phase['vx']:+.2f} ee={ee_str}  total_selections={int(total)}"
     )
     for q in range(num_active):
         counts_q = hist[q]
@@ -71,41 +84,42 @@ def _print_phase_histogram(
         topk_vals, topk_idx = counts_q.topk(k)
         used = (counts_q > 0).sum().item()
         entries = "  ".join(
-            f"idx={int(i)}({int(v)/max(total/num_active,1)*100:.1f}%)"
+            f"idx={int(i)}({int(v) / max(total / num_active, 1) * 100:.1f}%)"
             for i, v in zip(topk_idx.tolist(), topk_vals.tolist())
         )
         print(f"  codebook[{q}]: used={used}/{codebook_size}  top{k}= {entries}")
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
-    parser = argparse.ArgumentParser("Play Task Learning Policy")
+    parser = argparse.ArgumentParser("Play Task Learning Policy – Reaching Task")
 
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--imitation_ckpt", type=str, required=True)
     parser.add_argument("--expert_ckpt", type=str, required=True)
     parser.add_argument("--num_envs", type=int, default=16)
-    parser.add_argument("--task_goal_dim", type=int, default=3)
-    parser.add_argument("--max_steps", type=int, default=0, help="Max steps to run (0=infinite)")
+    parser.add_argument("--max_steps", type=int, default=0, help="Max steps (0=infinite)")
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--random", action="store_true")
     parser.add_argument("--random_range", type=str)
 
-    # Single fixed command
+    # Simple fixed overrides (no phases)
     parser.add_argument("--vx", type=float, default=None)
     parser.add_argument("--vy", type=float, default=None)
-    # yaw is in degrees (delta added to current robot yaw); kept for backward compat
-    parser.add_argument("--yaw", type=float, default=None, help="Yaw delta in degrees")
 
-    # Phase sequence (overrides --vx/--vy/--yaw if provided)
+    # Phase sequence
     parser.add_argument(
         "--phases",
         type=str,
         default=None,
         help=(
-            'JSON list of phases, e.g. \'[{"vx":1.0,"vy":0,"yaw_deg":0,"steps":200},...]\'. '
-            "yaw_deg is the delta orientation in degrees added to current robot yaw. "
-            "Scenario A (explicit turn): yaw_deg=180 in phase 2. "
-            "Scenario B (implicit flip): vx=-1.0 in phase 2, yaw_deg=0."
+            'JSON list of phases. Each phase: {"vx":float,"vy":float,"steps":int,'
+            '"ee_targets":[[x,y,z],[x,y,z]] or null}. '
+            "ee_targets null = free resampling. "
+            "Wings example: ee_targets=[[-0.05,-0.65,1.0],[-0.05,0.65,1.0]]"
         ),
     )
 
@@ -118,8 +132,8 @@ def main():
     import g1_hybrid_gym.tasks  # noqa: register envs
 
     from g1_hybrid_gym.tasks.direct.g1_hybrid_gym.rl import rlgames_model_registry  # noqa
-    from g1_hybrid_gym.tasks.direct.g1_hybrid_gym.g1_hybrid_gym_env_cfg_task import G1HybridGymEnvTaskCfg
-    from g1_hybrid_gym.tasks.direct.g1_hybrid_gym.g1_hybrid_gym_env_navigation_task import G1HybridGymEnvTask
+    from g1_hybrid_gym.tasks.direct.g1_hybrid_gym.g1_hybrid_gym_env_cfg_reaching_task import G1HybridGymEnvReachingCfg
+    from g1_hybrid_gym.tasks.direct.g1_hybrid_gym.g1_hybrid_gym_env_reaching_task import G1HybridGymEnvReaching
     from g1_hybrid_gym.tasks.direct.g1_hybrid_gym.rl.wrapper_task_ppo import TaskA2CNetwork
     from g1_hybrid_prior.models.task_learning_block import TaskLearningBlock, TaskCritic
 
@@ -128,46 +142,41 @@ def main():
     cfg_path = Path(PARENT_DIR / "train_config/TaskLearning.yaml")
     cfg_path_imitation = Path(PARENT_DIR / "train_config/ImitationLearning.yaml")
 
-    if cfg_path.exists():
-        cfg = yaml.safe_load(cfg_path.read_text())
-    else:
-        raise FileNotFoundError(f"[TASK PLAY] Config not found: {cfg_path}")
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"[REACHING PLAY] Config not found: {cfg_path}")
+    cfg = yaml.safe_load(cfg_path.read_text())
 
-    env_cfg = G1HybridGymEnvTaskCfg()
+    env_cfg = G1HybridGymEnvReachingCfg()
     env_cfg.scene.num_envs = args.num_envs
     env_cfg.sim.device = device
 
-    env = G1HybridGymEnvTask(cfg=env_cfg, render_mode="human")
+    env = G1HybridGymEnvReaching(cfg=env_cfg, render_mode="human")
 
-    # Parse phases or build a single-phase list from --vx/--vy/--yaw
+    # task_goal_dim comes from the env (2 + num_arm_ee * 3 = 8)
+    task_goal_dim = env.task_goal_dim
+    s_dim = env.s_dim
+    physical_action_dim = 29
+
+    print(f"[INFO] task_goal_dim={task_goal_dim}, s_dim={s_dim}, arm_ee={env.arm_ee_names}")
+
+    # Parse phases or build one from --vx/--vy
     phases = None
     if args.phases is not None:
         phases = json.loads(args.phases)
         print(f"[INFO] Phase sequence loaded: {len(phases)} phases")
-    elif args.vx is not None or args.vy is not None or args.yaw is not None:
-        # Fixed single command — yaw is already in degrees, no conversion needed
+    elif args.vx is not None or args.vy is not None:
         phases = [{
-            "vx": args.vx if args.vx is not None else 0.5,
+            "vx": args.vx if args.vx is not None else 0.0,
             "vy": args.vy if args.vy is not None else 0.0,
-            "yaw_deg": args.yaw if args.yaw is not None else 0.0,
+            "ee_targets": None,
             "steps": args.max_steps if args.max_steps > 0 else 999_999_999,
         }]
-        print(f"[INFO] Fixed command: vx={phases[0]['vx']}, vy={phases[0]['vy']}, yaw_deg={phases[0]['yaw_deg']}")
-
-    obs_reset = env.reset()
-    if isinstance(obs_reset, tuple):
-        obs_reset = obs_reset[0]
-    obs_policy = obs_reset["policy"]
-    full_obs_dim = obs_policy.shape[-1]
-    s_dim = full_obs_dim - args.task_goal_dim
-    physical_action_dim = 29
-
-    print(f"[INFO] obs_dim={full_obs_dim}, s_dim={s_dim}, task_goal_dim={args.task_goal_dim}")
+        print(f"[INFO] Fixed command: vx={phases[0]['vx']}, vy={phases[0]['vy']}")
 
     task_block = TaskLearningBlock(
         s_dim=s_dim,
         goal_dim=env.GOAL_DIM,
-        task_goal_dim=args.task_goal_dim,
+        task_goal_dim=task_goal_dim,
         action_dim=physical_action_dim,
         imitation_ckpt_path=args.imitation_ckpt,
         expert_ckpt_path=args.expert_ckpt,
@@ -175,13 +184,13 @@ def main():
         imitation_cfg_path=cfg_path_imitation,
     ).to(device)
 
-    critic = TaskCritic(s_dim=s_dim, goal_dim=args.task_goal_dim, cfg_path=cfg_path).to(device)
+    critic = TaskCritic(s_dim=s_dim, goal_dim=task_goal_dim, cfg_path=cfg_path).to(device)
 
     a2c_network = TaskA2CNetwork(
         task_block=task_block,
         critic=critic,
         s_dim=s_dim,
-        task_goal_dim=args.task_goal_dim,
+        task_goal_dim=task_goal_dim,
     )
 
     print(f"[INFO] Loading checkpoint: {args.checkpoint}")
@@ -195,7 +204,7 @@ def main():
     missing, unexpected = a2c_network.load_state_dict(a2c_keys, strict=False)
     print(f"[INFO] Loaded a2c_network: missing={len(missing)}, unexpected={len(unexpected)}")
     if missing:
-        print(f"Missing (first 10): {missing[:10]}")
+        print(f"  Missing (first 10): {missing[:10]}")
 
     a2c_network.eval()
     task_block.eval()
@@ -214,7 +223,11 @@ def main():
     random_range = ast.literal_eval(args.random_range) if args.random_range else [0, codebook_size]
     low, high = random_range
 
+    obs_reset = env.reset()
+    if isinstance(obs_reset, tuple):
+        obs_reset = obs_reset[0]
     obs = obs_reset
+
     step_count = 0
     episode_rewards = torch.zeros(args.num_envs, device=device)
     episode_lengths = torch.zeros(args.num_envs, device=device, dtype=torch.long)
@@ -242,7 +255,7 @@ def main():
         with torch.no_grad():
             s_norm = task_block._normalize_s(s)
             hl_out = task_block.high_level(s_norm, g)
-            logits = hl_out["logits"]  # (B, num_active, codebook_size)
+            logits = hl_out["logits"]
 
             if args.deterministic:
                 indices = logits.argmax(dim=-1)
@@ -258,7 +271,7 @@ def main():
         step_count += 1
         phase_step += 1
 
-        # Accumulate codebook index histogram for current phase
+        # Accumulate codebook histogram
         if phases is not None:
             for q in range(num_active):
                 phase_hist[q].scatter_add_(
@@ -303,7 +316,7 @@ def main():
             episode_rewards[done_ids] = 0.0
             episode_lengths[done_ids] = 0
 
-    # Final histogram for last phase
+    # Final histogram for last incomplete phase
     if phases is not None and phase_hist.sum() > 0:
         _print_phase_histogram(phase_hist, phase_idx, phases[min(phase_idx, len(phases) - 1)])
 
